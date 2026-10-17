@@ -21,4 +21,4 @@ They remain marked experimental for the DX23012 until verified against physical 
 The authoritative DX23012 fixture was captured on 2026-08-26 from device `IOTBT144`.
 It uses service `FFFF`, write characteristic `FF01`, notify characteristic `FF02`, and
 returns a JSON-wrapped 27-byte `EA 81` state. Its unknown layout is retained without
-assigning IOTBT mesh-address/mode bytes to model, firmware, or RGB fields.
+assigning IOTBT product-ID/version bytes (3-5) to model, firmware, or RGB fields.

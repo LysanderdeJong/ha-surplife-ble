@@ -32,8 +32,11 @@ These corrections showed the captured traffic from the Android app was a sequenc
 
 - State frames use the `EA 81` prefix.
 - The full state frame is 27 bytes.
-- Bytes 3 and 4 contain a mesh address. Do not use them as a fixed device signature.
-- Byte 5 identifies the verified IOTBT state layout as `0x09`.
+- Bytes 3 and 4 are the device product ID, big-endian. The DX23012 reports `0x00AA` (170).
+  This was earlier mislabeled as a mesh address.
+- Byte 5 is `0x09` on the verified DX23012. It is probably a led/firmware version, not a
+  layout ID. This is still a hypothesis. The classifier still uses `0x09` as part of the
+  DX23012 signature.
 - Byte 6 is power: `0x23` means on, `0x24` means off.
 - Bytes 11 and 12 contain packed hue and saturation.
 - Hue is the packed value shifted right by seven bits.

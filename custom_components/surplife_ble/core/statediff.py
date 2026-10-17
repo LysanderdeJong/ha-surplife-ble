@@ -48,9 +48,24 @@ EA81_FIELDS: list[FieldAnnotation] = [
     FieldAnnotation(0, "signature", CONFIRMED, "EA frame marker"),
     FieldAnnotation(1, "signature", CONFIRMED, "81 frame marker"),
     FieldAnnotation(2, "version?", UNKNOWN, "always 0x01 in captures so far"),
-    FieldAnnotation(3, "mesh_addr_low", HYPOTHESIS, "IOTBT mesh address (low byte)"),
-    FieldAnnotation(4, "mesh_addr_high", HYPOTHESIS, "IOTBT mesh address (high byte)"),
-    FieldAnnotation(5, "mode", HYPOTHESIS, "IOTBT mode byte"),
+    FieldAnnotation(
+        3,
+        "product_id_high",
+        CONFIRMED,
+        "product ID, big-endian high byte (Surplife APK ZGHBDevice; matches advert service data)",
+    ),
+    FieldAnnotation(
+        4,
+        "product_id_low",
+        CONFIRMED,
+        "product ID, big-endian low byte (0xAA DX23012, 0xC2 curtain)",
+    ),
+    FieldAnnotation(
+        5,
+        "led_version?",
+        HYPOTHESIS,
+        "led/firmware version (0x09 DX23012, 0x03 curtain 0xC2); not a layout ID",
+    ),
     FieldAnnotation(6, "power", CONFIRMED, "0x23=on, 0x24=off"),
     FieldAnnotation(7, "color_white_mode", CONFIRMED, "0x24=color mode, 0x25=white mode"),
     FieldAnnotation(8, "color_temp", CONFIRMED, "0x01=color mode, 0x6f=white mode"),
@@ -608,7 +623,8 @@ def generate_recommendations(analysis: BatchAnalysis) -> list[Recommendation]:
             app_mode="link",
             action="Check if the lamp is linked to any group; probe with and without linking",
             rationale=(
-                "Link/group mode may change the mesh address bytes (pos 3-4). "
+                "Link/group mode is not expected to change the product ID bytes (pos 3-4); "
+                "a change there would be a surprise. "
                 "Only relevant if you have multiple Surplife devices."
             ),
             target_fields=[3, 4],

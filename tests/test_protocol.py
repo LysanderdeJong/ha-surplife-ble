@@ -85,7 +85,8 @@ def test_unknown_ea81_layout_remains_control_locked() -> None:
     assert "rgb" not in resolution.capabilities
 
 
-def test_dx23012_mesh_address_does_not_change_codec() -> None:
+def test_dx23012_product_id_bytes_do_not_change_codec() -> None:
+    """Bytes 3-4 are the product ID; unknown IDs keep the DX23012 layout match."""
     packet = bytearray(bytes.fromhex(FIXTURES["dx23012_iotbt144"]["state_hex"]))
     packet[3:5] = bytes.fromhex("1234")
     classified = classify_packet(bytes(packet))

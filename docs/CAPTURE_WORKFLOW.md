@@ -26,10 +26,9 @@ query was raw, MagicHome2 standard-length, or MagicHome2 length-plus-two.
 For the physical DX23012 captured on 2026-08-26, `classic-magichome2` produced a
 repeatable JSON-wrapped `EA 81` response on `FFFF/FF01` → `FF02`. The state fixture is
 stored as `dx23012_iotbt144` in `tests/fixtures/protocol_packets.json` and is authoritative
-for this lamp. Do not interpret byte `0xAA` as a model or byte `0x09` as firmware: in the
-IOTBT DeviceState2 layout, bytes 3-4 are a mesh address and byte 5 is a mode. Color bytes
-remain unresolved, and control stays locked until Telink-vs-segment command selection is
-verified.
+for this lamp. Bytes 3-4 (`00 AA`) are the big-endian product ID, not a mesh address. Byte 5
+(`0x09`) is probably a led/firmware version; treat that as a hypothesis, not a layout ID.
+Control stays locked until Telink-vs-segment command selection is verified.
 
 ## 2b. Decode the state layout by diffing
 
