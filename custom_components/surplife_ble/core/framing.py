@@ -62,6 +62,63 @@ def wrap_magichome(
     ) + payload
 
 
+DEFAULT_MAX_LEN = 182
+SEGMENT_FLAG = 0x40
+SEGMENT_LAST_FLAG = 0x8000
+
+
+def wrap_magichome_segments(
+    payload: bytes,
+    sequence: int,
+    *,
+    command_family: int = 0x0A,
+    max_len: int = DEFAULT_MAX_LEN,
+) -> list[bytes]:
+    """Wrap a command, splitting it into transport segments when it is too long.
+
+    Mirrors ``LowerTransportLayerEncoder.generator`` (writeVersion 0) from the
+    Surplife app. ``max_len`` is the largest frame written in one ATT write; the
+    app uses ATT MTU - 4 (182 by default).
+
+    - A payload of at most ``max_len - 8`` bytes is one frame, byte-identical to
+      :func:`wrap_magichome`.
+    - Otherwise the first frame is ``40 seq 00 00 total_len(2) max_len-7 cmd`` plus
+      ``max_len - 8`` payload bytes (exactly ``max_len`` bytes).
+    - Later frames are ``40 seq idx(2) chunk_len chunk``. ``idx`` starts at 1, the
+      last one has bit 15 set, and each chunk holds at most ``max_len - 5`` bytes.
+    - Every segment of one message carries the same sequence byte.
+    """
+    if not 9 <= max_len <= 255:
+        raise ValueError("max_len must be between 9 and 255")
+    if not 0 <= sequence <= 0xFF:
+        raise ValueError("sequence must be between 0 and 255")
+    if not 0 <= command_family <= 0xFF:
+        raise ValueError("command_family must be between 0 and 255")
+    total = len(payload)
+    if total > 0xFFFF:
+        raise ValueError("framed payload is too long")
+    if total <= max_len - 8:
+        return [wrap_magichome(payload, sequence, command_family=command_family)]
+    first = max_len - 8
+    frames = [
+        bytes((SEGMENT_FLAG, sequence, 0, 0))
+        + total.to_bytes(2, "big")
+        + bytes((max_len - 7, command_family))
+        + payload[:first]
+    ]
+    step = max_len - 5
+    position = first
+    index = 1
+    while position < total:
+        chunk = payload[position : position + step]
+        position += len(chunk)
+        marker = index | (SEGMENT_LAST_FLAG if position >= total else 0)
+        header = bytes((SEGMENT_FLAG, sequence)) + marker.to_bytes(2, "big")
+        frames.append(header + bytes((len(chunk),)) + chunk)
+        index += 1
+    return frames
+
+
 def unwrap_magichome(frame: bytes) -> tuple[bytes, str] | None:
     """Return the inner payload and framing description when a frame is recognized."""
     if len(frame) < 8 or frame[2:4] != MAGIC_MARKER:
