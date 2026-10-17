@@ -24,6 +24,7 @@ from .models import (
     rgb_state_matches,
 )
 from .protocol import (
+    CURTAIN_C2_CODEC,
     ProbeFrame,
     byte_to_percent,
     classic_power,
@@ -474,6 +475,8 @@ class LightClient:
                 "control remains locked until the IOTBT Telink or segment "
                 "command family is resolved"
             )
+        if self.resolution.codec == CURTAIN_C2_CODEC:
+            raise RuntimeError("control remains locked for the IOTBT curtain (product 0xC2)")
         return self.resolution, self._probe_frame
 
     async def set_power(self, turn_on: bool) -> None:

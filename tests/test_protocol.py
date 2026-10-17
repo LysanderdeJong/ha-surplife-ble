@@ -95,6 +95,52 @@ def test_dx23012_product_id_bytes_do_not_change_codec() -> None:
     assert resolution.codec == "iotbt-ea81"
 
 
+@pytest.mark.parametrize(
+    ("key", "power"),
+    [("state_hex", True), ("state_off_hex", False), ("state_after_color_hex", True)],
+)
+def test_iotbt_curtain_c2_classification_and_power(key: str, power: bool) -> None:
+    packet = bytes.fromhex(FIXTURES["iotbt437_curtain_c2"][key])
+    classified = classify_packet(packet)
+    assert classified is not None
+    resolution, inner, framing = classified
+    assert inner == packet
+    assert framing == "raw"
+    assert resolution.frame_family == "extended-ea81"
+    assert resolution.codec == "iotbt-ea81-curtain-c2"
+    assert resolution.capabilities == {"power", "extended-state"}
+    assert "rgb" not in resolution.capabilities
+    assert "brightness" not in resolution.capabilities
+    assert any("Control remains locked" in note for note in resolution.notes)
+
+    state = parse_state(packet)
+    assert state is not None
+    assert state.power is power
+    assert state.rgb is None
+    assert state.raw_hex == packet.hex()
+
+
+def test_iotbt_curtain_c2_fixture_is_not_dx23012_authoritative() -> None:
+    assert FIXTURES["iotbt437_curtain_c2"]["authoritative_for_dx23012"] is False
+
+
+def test_dx23012_fixture_still_classifies_as_iotbt_ea81() -> None:
+    packet = bytes.fromhex(FIXTURES["dx23012_iotbt144"]["state_hex"])
+    classified = classify_packet(packet)
+    assert classified is not None
+    resolution, _inner, _framing = classified
+    assert resolution.codec == "iotbt-ea81"
+    assert {"rgb", "brightness", "power"}.issubset(resolution.capabilities)
+
+
+def test_curtain_c2_product_id_only_matches_exact_value() -> None:
+    packet = bytearray(bytes.fromhex(FIXTURES["iotbt437_curtain_c2"]["state_hex"]))
+    packet[3] = 0x01  # product 0x01C2 is not the curtain
+    classified = classify_packet(bytes(packet))
+    assert classified is not None
+    assert classified[0].codec == "unresolved-ea81"
+
+
 def test_dx23012_odd_hue_packed_bit_does_not_change_codec() -> None:
     packet = bytes.fromhex("ea810100aa0923240150f00ee02f006405001dffffffff01000000")
     classified = classify_packet(packet)

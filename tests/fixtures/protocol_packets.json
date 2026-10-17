@@ -20,6 +20,20 @@
     "wrapped_response_hex": "041e8000004d4e0a7b22636f6465223a302c227061796c6f6164223a22454138313031303041413039323332353646353046303030363436343030363430353030314446464646464646463031303030303030227d",
     "state_hex": "ea810100aa0923256f50f0006464006405001dffffffff01000000"
   },
+  "iotbt437_curtain_c2": {
+    "source": "physical IOTBT437 curtain lights (product 0xC2) probe 2026-10-17; see docs/IOTBT_CURTAIN_0xC2_FINDINGS.md",
+    "authoritative_for_dx23012": false,
+    "state_hex": "ea810100c20323620164f00000000000010190000001020300",
+    "state_off_hex": "ea810100c20324620164f00000000000010190000001020300",
+    "state_after_color_hex": "ea810100c20323666e64f00000000000010190000001020300",
+    "advertisement": {
+      "service_data_uuid": "00005a00-0000-1000-8000-00805f9b34fb",
+      "service_data_hex": "80070865f01b143700c20e030105",
+      "manufacturer_id": 23040,
+      "manufacturer_data_hex": "8023620164f0000000000001019000000102030000000000000000",
+      "manufacturer_data_after_color_hex": "8023666e64f0000000000001019000000102030000000000000000"
+    }
+  },
   "e122_uniform_red": {
     "source": "flux_led PR #544 open hardware-verified packet",
     "authoritative_for_dx23012": false,

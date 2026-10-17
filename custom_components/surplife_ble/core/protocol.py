@@ -17,6 +17,9 @@ POWER_ON = 0x23
 POWER_OFF = 0x24
 MODEL_FLOOR_LAMP_RGBCW = 0x0E
 KNOWN_EXTENDED_MODELS = {0x77, 0x82, 0xB6}
+# EA 81 bytes 3-4 (big-endian) are the device product ID, not a mesh address.
+IOTBT_PRODUCT_CURTAIN_C2 = 0x00C2
+CURTAIN_C2_CODEC = "iotbt-ea81-curtain-c2"
 
 # IOTBT DX23012 state field positions, confirmed by state-diff captures
 # on 2026-08-26/27. See docs/CAPTURE_WORKFLOW.md and statediff.py.
@@ -108,6 +111,14 @@ def classify_packet(packet: bytes) -> tuple[ProtocolResolution, bytes, str] | No
                 codec = "extended-custom"
                 confidence = 0.95
                 capabilities.update({"rgb", "brightness", "candidate-white"})
+            elif (candidate[3] << 8 | candidate[4]) == IOTBT_PRODUCT_CURTAIN_C2:
+                # Bytes 3-4 are the big-endian product ID. See
+                # docs/IOTBT_CURTAIN_0xC2_FINDINGS.md.
+                model_num = None
+                firmware = None
+                codec = CURTAIN_C2_CODEC
+                confidence = 0.90
+                notes.append("IOTBT symphony curtain (product 0xC2). Control remains locked.")
             elif (
                 len(candidate) >= 27
                 and candidate[5] == 0x09
@@ -207,7 +218,7 @@ def parse_state(packet: bytes) -> LightState | None:
             raw_hex=state.hex(),
         )
     if resolution.frame_family == "extended-ea81":
-        if resolution.codec == "unresolved-ea81":
+        if resolution.codec in ("unresolved-ea81", CURTAIN_C2_CODEC):
             return LightState(
                 power=state[IOTBT_POS_POWER] == POWER_ON,
                 raw_hex=state.hex(),
