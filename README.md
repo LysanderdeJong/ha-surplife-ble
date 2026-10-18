@@ -5,6 +5,8 @@
 
 This integration controls Surplife and MagicHome2 Bluetooth LED lights in Home Assistant.
 It supports the MIHEAL DX23012 floor lamp and similar devices that use the IOTBT BLE protocol.
+It also supports the IOTBT curtain lights (product `0x00C2`, for example `IOTBT437`) as a light
+and as a 20x20 screen for images and GIFs.
 
 ## Features
 
@@ -15,6 +17,7 @@ It supports the MIHEAL DX23012 floor lamp and similar devices that use the IOTBT
 | White brightness | Needs hardware retest |
 | Overall brightness | Verified on one DX23012 |
 | State confirmation | Verified on one DX23012 |
+| Curtain lights: power, RGB color, brightness, effects, screen | Verified on one IOTBT437 |
 | Multiple devices | Supported |
 | Automatic discovery | Supported |
 | Manual setup | Supported |
@@ -22,6 +25,7 @@ It supports the MIHEAL DX23012 floor lamp and similar devices that use the IOTBT
 ## Supported devices
 
 - MIHEAL DX23012 floor lamp with the verified IOTBT state signature
+- IOTBT curtain lights (product `0x00C2`, 20x20 LEDs, tested as `IOTBT437`)
 
 Other `IOTBT` devices can use different commands. An `IOTBT` name alone does not prove compatibility.
 
@@ -57,6 +61,96 @@ Configure the integration through the UI:
 
 > **Tip:** If discovery does not find your device, use a BLE scanner app to find its address.
 > The device advertises as `IOTBT` followed by a short string. For example, `IOTBT144`.
+
+## IOTBT curtain lights (product 0xC2)
+
+A curtain is added like any other device. When the integration recognizes it, one device
+holds four entities:
+
+| Entity | What it does |
+| --- | --- |
+| Light | Power, RGB color and brightness, and the effect list. |
+| Screen (media player) | Plays images and GIFs on the 20x20 grid. |
+| Screen preview (image) | A 200x200 PNG of the first frame of the last upload. |
+| Animation speed (number) | Speed of the stored animation, 1 to 100. |
+
+The Screen, preview and speed entities appear only for curtains. Other devices are unchanged.
+
+**Light.** The curtain is RGB only. It has no white channel. It never reports its color or
+brightness, so the integration shows the last values it sent and marks the state as assumed.
+Power, effect and animation state are read back from the device. Brightness is sent with every
+color, effect and animation command. Changing only the brightness resends the current color,
+effect or animation.
+
+**Effects.** The effect list holds `Animation (uploaded)` and `Effect 1` to `Effect 100`.
+Effect 1 (a color cycle) and effect 10 (a rainbow fill) are verified. The other IDs are not.
+The device accepts any ID, so the list length of 100 is a guess. `Animation (uploaded)` plays
+the animation stored in the curtain.
+
+**Screen.** The Screen media player supports play, pause, stop, turn on, turn off, play media
+and browse media. Browsing shows images only.
+
+- `play_media` takes an image or GIF from a media source, an `http(s)` URL (5 MB at most), or
+  a local file in an allowed directory (`allowlist_external_dirs`). Use media type `image/gif`,
+  `image/png` and so on, or `url`. The picture is scaled to 20x20, written to the curtain and
+  played with mode 1.
+- Play loops the stored animation. Pause holds frame 1 (play mode 2). Stop and turn off power
+  the curtain off.
+- The media title is the name of the last uploaded file.
+
+**Services.** Both services target a curtain light entity.
+
+```yaml
+service: surplife_ble.upload_animation
+target:
+  entity_id: light.curtain
+data:
+  path: /config/www/animations/fire.gif   # or url: https://example.com/fire.gif
+  speed: 50            # 1-100, default 50
+  brightness: 100      # 1-100, default 100
+  mode: 1              # default 1, see below
+  controller_side: left   # left or right, default left
+  flip: false
+  max_frames: 128      # default and limit 128
+  resample: box        # nearest, box or lanczos
+```
+
+```yaml
+service: surplife_ble.play_animation
+target:
+  entity_id: light.curtain
+data:
+  mode: 1
+  speed: 50
+  brightness: 100
+```
+
+| Play mode | Behavior |
+| --- | --- |
+| 0 | Loop all frames |
+| 1 | Loop all frames (constant). This is the default and what the Surplife app sends |
+| 2 and up | Hold frame 1 |
+
+**Controller side.** The curtain has no front or back. The controller box hangs on the left or
+the right. `controller_side` says which side of the picture it is on, so the picture appears
+upright. With `left`, image column 0 is the string nearest the controller. With `right`, the
+columns are reversed. `flip` swaps top and bottom.
+
+**Limits and flash wear.**
+
+- Every upload writes the curtain's flash memory. The animation then survives power cycles and
+  plays without Bluetooth. Do not upload from a fast automation. Use `play_animation` to start
+  or restart the stored animation.
+- The curtain holds at most 128 frames of 20x20 (102400 bytes). An animation with more frames
+  fails with a "too many frames" error. If the device says it is too big, you get a "too big
+  for device memory" error.
+- Decoding runs in an executor. A 128-frame upload takes about 30 seconds.
+- The curtain acknowledges every frame and the integration waits for it before it sends the
+  next one. If the Bluetooth link is too weak, the upload stops with an error such as
+  "no reply to upload step 'content 98'" instead of losing frames silently. Move the
+  Bluetooth adapter or proxy closer and try again.
+- The preview is kept in memory. It is empty after a restart until the next upload.
+- Needs no extra packages: the integration has its own LZ4 encoder. Pillow comes with Home Assistant.
 
 ## Known limitations
 
@@ -139,6 +233,33 @@ ble-rgb probe --device COREBLUETOOTH-UUID --allow-probe-write \
 `inspect` does not write to the device.
 `probe` sends known state queries, one at a time, after it subscribes to notifications.
 Review the output before you use `on`, `off`, `color`, `white`, or `brightness`.
+
+### IOTBT curtain test commands
+
+`ble-rgb curtain` sends hardware-verified commands to an IOTBT curtain light (product `0x00C2`,
+for example `IOTBT437`) and prints the decoded `EA 81` state.
+It needs `--allow-curtain-c2`, writes only to `FF01`, and never touches the OTA service.
+The Home Assistant integration also controls the curtain (see above).
+See [docs/IOTBT_CURTAIN_0xC2_FINDINGS.md](docs/IOTBT_CURTAIN_0xC2_FINDINGS.md).
+
+```bash
+ble-rgb curtain state --device MAC --allow-curtain-c2
+ble-rgb curtain color --device MAC --allow-curtain-c2 --rgb 0,0,255 --brightness 50
+ble-rgb curtain effect --device MAC --allow-curtain-c2 --id 10 --speed 80
+ble-rgb curtain upload --device MAC --image anim.gif --allow-curtain-c2 --allow-flash-write \
+  --speed 50
+ble-rgb curtain upload --device MAC --image anim.gif --allow-curtain-c2 --allow-flash-write \
+  --controller-side right --speed 50
+```
+
+`upload` stores a 20x20 image or animation in the curtain's flash, so it also needs
+`--allow-flash-write`. The curtain holds at most 128 frames (102400 bytes) and then plays
+them on its own. `--max-frames` defaults to that limit, and a larger upload is rejected by
+the device with status `02`. It needs the optional packages: `pip install -e '.[curtain]'`.
+The curtain has no front or back, so the controller box can hang on the left or the right.
+`--controller-side left|right` (default `left`) says which side of the image it is on.
+With `left`, image column 0 is the string nearest the controller. With `right`, the columns
+are reversed. `--mirror` flips the choice.
 
 For an unknown protocol, the safest method is state-diffing.
 Set the lamp to known states with the vendor app.

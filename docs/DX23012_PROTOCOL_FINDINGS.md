@@ -33,7 +33,8 @@ These corrections showed the captured traffic from the Android app was a sequenc
 - State frames use the `EA 81` prefix.
 - The full state frame is 27 bytes.
 - Bytes 3 and 4 are the device product ID, big-endian. The DX23012 reports `0x00AA` (170).
-  This was earlier mislabeled as a mesh address.
+  This was earlier mislabeled as a mesh address. See `docs/IOTBT_CURTAIN_0xC2_FINDINGS.md`
+  for the evidence.
 - Byte 5 is `0x09` on the verified DX23012. It is probably a led/firmware version, not a
   layout ID. This is still a hypothesis. The classifier still uses `0x09` as part of the
   DX23012 signature.

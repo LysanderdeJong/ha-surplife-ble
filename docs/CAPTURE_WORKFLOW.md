@@ -28,7 +28,8 @@ repeatable JSON-wrapped `EA 81` response on `FFFF/FF01` → `FF02`. The state fi
 stored as `dx23012_iotbt144` in `tests/fixtures/protocol_packets.json` and is authoritative
 for this lamp. Bytes 3-4 (`00 AA`) are the big-endian product ID, not a mesh address. Byte 5
 (`0x09`) is probably a led/firmware version; treat that as a hypothesis, not a layout ID.
-Control stays locked until Telink-vs-segment command selection is verified.
+See `docs/IOTBT_CURTAIN_0xC2_FINDINGS.md` for the evidence. Control stays locked until
+Telink-vs-segment command selection is verified.
 
 ## 2b. Decode the state layout by diffing
 
