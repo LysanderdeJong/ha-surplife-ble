@@ -1,17 +1,17 @@
 """Command builders and state parser for the IOTBT curtain (product 0x00C2).
 
-These are hardware-verified on an IOTBT437 (2026-10-17). They exist for the
-``ble-rgb curtain`` test commands. The Home Assistant integration does not use them:
-control stays locked for codec ``iotbt-ea81-curtain-c2``. See
-docs/IOTBT_CURTAIN_0xC2_FINDINGS.md.
+These are hardware-verified on an IOTBT437 (2026-10-17). The ``ble-rgb curtain`` commands
+and the Home Assistant integration (light, Screen media player, services) both use them
+through ``LightClient``. See docs/IOTBT_CURTAIN_0xC2_FINDINGS.md.
 """
 
 from __future__ import annotations
 
 import colorsys
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, NamedTuple
+from typing import Any, BinaryIO, NamedTuple
 
 from .framing import MAGIC_MARKER, with_checksum
 from .lz4_block import compress as lz4_compress
@@ -37,6 +37,19 @@ MODE_NAMES = {
     MODE_SCENE: "scene",
     MODE_DIY: "diy",
 }
+
+# Built-in effect IDs. Effects 1 and 10 are verified on hardware. The device echoes any ID
+# from 0 to 255 in its state, so the real number of effects is unknown. 100 is a
+# tentative upper bound for the Home Assistant effect list.
+CURTAIN_EFFECT_COUNT = 100
+EFFECT_ANIMATION = "Animation (uploaded)"
+EFFECT_PREFIX = "Effect "
+
+# Play modes for `E2 09`: 0 loops all frames, 1 loops all frames (what the app sends, the
+# default), 2 and above hold frame 1.
+PLAY_MODE_LOOP = 0
+PLAY_MODE_LOOP_APP = 1
+DEFAULT_PLAY_MODE = PLAY_MODE_LOOP_APP
 
 GRID = 20
 PIXELS_PER_FRAME = GRID * GRID
@@ -74,6 +87,34 @@ def _check_range(name: str, value: int, low: int, high: int) -> int:
     if not low <= value <= high:
         raise ValueError(f"{name} must be between {low} and {high}")
     return value
+
+
+def effect_list() -> list[str]:
+    """Names for the Home Assistant effect list: the uploaded animation, then Effect 1..N."""
+    return [EFFECT_ANIMATION, *(f"{EFFECT_PREFIX}{i}" for i in range(1, CURTAIN_EFFECT_COUNT + 1))]
+
+
+def effect_id_from_name(name: str) -> int:
+    """Return the effect ID for ``"Effect <n>"``. Raises ValueError for other names."""
+    if name.startswith(EFFECT_PREFIX) and name[len(EFFECT_PREFIX) :].isdigit():
+        effect_id = int(name[len(EFFECT_PREFIX) :])
+        if 1 <= effect_id <= CURTAIN_EFFECT_COUNT:
+            return effect_id
+    raise ValueError(f"unknown curtain effect: {name!r}")
+
+
+def effect_name_for_state(mode: int | None, effect_id: int | None) -> str | None:
+    """Return the active effect name from EA 81 mode (byte 7) and byte 8, or None.
+
+    Mode 0x67 is a built-in effect (byte 8 is its ID). Mode 0x74 is the uploaded
+    animation. Mode 0x66 (color) and the initial mode have no effect. An effect ID
+    outside 1..N has no name in the list.
+    """
+    if mode == MODE_DIY:
+        return EFFECT_ANIMATION
+    if mode == MODE_SCENE and effect_id is not None and 1 <= effect_id <= CURTAIN_EFFECT_COUNT:
+        return f"{EFFECT_PREFIX}{effect_id}"
+    return None
 
 
 def state_query() -> CurtainCommand:
@@ -286,6 +327,40 @@ def image_to_frame(
     return frame
 
 
+def frame_to_image(
+    frame: Sequence[RGB],
+    *,
+    controller_side: str = "left",
+    mirror: bool = False,
+    flip: bool = False,
+) -> list[RGB]:
+    """Invert :func:`image_to_frame`: buffer-order pixels back to row-major image pixels."""
+    if len(frame) != PIXELS_PER_FRAME:
+        raise ValueError(f"a frame needs {PIXELS_PER_FRAME} pixels, got {len(frame)}")
+    return [
+        frame[pixel_index(x, y, controller_side=controller_side, mirror=mirror, flip=flip)]
+        for y in range(GRID)
+        for x in range(GRID)
+    ]
+
+
+def render_preview_png(pixels: Sequence[RGB], scale: int = 10) -> bytes:
+    """Render 400 row-major pixels as a PNG, scaled up with nearest-neighbor (200 x 200)."""
+    if len(pixels) != PIXELS_PER_FRAME:
+        raise ValueError(f"a preview needs {PIXELS_PER_FRAME} pixels, got {len(pixels)}")
+    try:
+        import io
+
+        from PIL import Image
+    except ImportError as err:
+        raise RuntimeError("Pillow is required to render a preview") from err
+    image = Image.frombytes("RGB", (GRID, GRID), bytes(c for pixel in pixels for c in pixel))
+    image = image.resize((GRID * scale, GRID * scale), Image.Resampling.NEAREST)
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
 def solid_frame(color: RGB) -> list[RGB]:
     """A frame with every pixel set to ``color`` (buffer order does not matter)."""
     return [color] * PIXELS_PER_FRAME
@@ -456,21 +531,25 @@ class ImageFrames(NamedTuple):
 
 
 def load_image_frames(
-    path: str,
+    path: str | os.PathLike[str] | BinaryIO,
     *,
     resample: str = "box",
     max_frames: int = 60,
     controller_side: str = "left",
     mirror: bool = False,
     flip: bool = False,
+    count_all: bool = True,
 ) -> ImageFrames:
     """Read every frame of a PNG, JPEG, GIF or WebP file as buffer-order 20 x 20 frames.
 
-    Frames are composited on black, converted to RGB and resized to 20 x 20 (stretched).
-    ``resample`` is nearest, box or lanczos. The device shows every frame for the same time,
-    so an animation frame that lasts N times the shortest frame duration is repeated N
-    times. At most ``max_frames`` frames are kept. ``controller_side``, ``mirror`` and
-    ``flip`` are described in :func:`pixel_index`.
+    ``path`` is a file name or a binary file object. Frames are composited on black,
+    converted to RGB and resized to 20 x 20 (stretched). ``resample`` is nearest, box or
+    lanczos. The device shows every frame for the same time, so an animation frame that
+    lasts N times the shortest frame duration is repeated N times. At most ``max_frames``
+    frames are kept. ``controller_side``, ``mirror`` and
+    ``flip`` are described in :func:`pixel_index`. With ``count_all=False`` decoding stops
+    one frame after ``max_frames``, so ``total`` is then only a lower bound
+    (``max_frames + 1`` means "more than ``max_frames``").
     """
     try:
         from PIL import Image, ImageSequence
@@ -505,7 +584,9 @@ def load_image_frames(
         for _ in range(repeats):
             total += 1
             if len(frames) >= max_frames:
-                continue
+                if count_all:
+                    continue
+                break
             rgba = source.convert("RGBA")
             background = Image.new("RGBA", rgba.size, (0, 0, 0, 255))
             rgb = Image.alpha_composite(background, rgba).convert("RGB")
@@ -517,6 +598,8 @@ def load_image_frames(
                     pixels, controller_side=controller_side, mirror=mirror, flip=flip
                 )
             )
+        if not count_all and len(frames) >= max_frames and total > max_frames:
+            break
     if not frames:
         raise ValueError("the image contains no frames")
     return ImageFrames(frames, total)

@@ -92,6 +92,10 @@ class LightClient:
         self._probe_frame: ProbeFrame | None = None
         self.resolution: ProtocolResolution | None = None
         self.state: LightState | None = None
+        # IOTBT curtain only: the device never reports color or brightness, so the last
+        # color sent is remembered here as assumed state.
+        self._curtain_rgb: tuple[int, int, int] | None = None
+        self._curtain_percent: int | None = None
 
     @property
     def connected(self) -> bool:
@@ -551,8 +555,6 @@ class LightClient:
                 "control remains locked until the IOTBT Telink or segment "
                 "command family is resolved"
             )
-        if self.resolution.codec == CURTAIN_C2_CODEC:
-            raise RuntimeError("control remains locked for the IOTBT curtain (product 0xC2)")
         return self.resolution, self._probe_frame
 
     async def set_power(self, turn_on: bool) -> None:
@@ -563,6 +565,8 @@ class LightClient:
             await self._send_inner(original_power(turn_on), probe.transport, note="power")
         elif resolution.codec == "iotbt-ea81":
             await self._send_inner(iotbt_power(turn_on), probe.transport, note="power")
+        elif resolution.codec == CURTAIN_C2_CODEC:
+            await self._send_curtain(curtain_c2.power(turn_on), "curtain power")
         elif turn_on:
             brightness = (
                 byte_to_percent(self.state.brightness)
@@ -601,6 +605,9 @@ class LightClient:
                 nine_byte=resolution.codec == "classic-9byte",
             )
             await self._send_inner(payload, probe.transport, note="set rgb")
+        elif resolution.codec == CURTAIN_C2_CODEC:
+            await self._set_curtain_rgb(red, green, blue, brightness)
+            return
         elif resolution.codec == "iotbt-ea81":
             payload = iotbt_e1_segment_rgb(red, green, blue, brightness)
             expected_brightness = round(brightness * 255 / 100)
@@ -681,6 +688,8 @@ class LightClient:
         experimental_e122: bool = False,
     ) -> None:
         resolution, probe = self._require_control_resolution()
+        if resolution.codec == CURTAIN_C2_CODEC:
+            raise RuntimeError("the IOTBT curtain is RGB-only and has no white channel")
         brightness = max(1, min(100, brightness))
         white_byte = round(brightness * 255 / 100)
         if resolution.codec.startswith("classic"):
@@ -712,6 +721,9 @@ class LightClient:
 
     async def set_brightness(self, brightness: int) -> None:
         brightness = max(1, min(100, brightness))
+        if self.resolution and self.resolution.codec == CURTAIN_C2_CODEC:
+            await self._set_curtain_brightness(brightness)
+            return
         if self.resolution and self.resolution.codec == "iotbt-ea81":
             # The 3B 01 standalone brightness command is not accepted by this
             # device. Re-send the current color or white command with the new
@@ -732,9 +744,113 @@ class LightClient:
     # IOTBT curtain (product 0xC2). All frames go to FF01 as MagicHome2 transport frames.
     # ------------------------------------------------------------------
 
+    @property
+    def is_curtain(self) -> bool:
+        return bool(self.resolution and self.resolution.codec == CURTAIN_C2_CODEC)
+
+    @property
+    def curtain_rgb(self) -> tuple[int, int, int] | None:
+        """The last color sent, or None. The device never reports it (assumed state)."""
+        return self._curtain_rgb
+
+    @property
+    def curtain_percent(self) -> int | None:
+        """The last brightness percent sent, or None. The device never reports it."""
+        return self._curtain_percent
+
+    def _require_curtain(self) -> None:
+        if not self.is_curtain:
+            raise RuntimeError("this device is not an IOTBT curtain (product 0xC2)")
+        if not self.resolution or not self.resolution.repeatable:
+            raise RuntimeError("control requires a repeatable state response from this connection")
+
     async def _ensure_ff02(self) -> None:
         if not any(_uuid_is(uuid, "ff02") for uuid in self._notifying):
             await self._start_notifications(only="ff02")
+
+    async def _send_curtain(self, command: curtain_c2.CurtainCommand, note: str) -> None:
+        """Frame a verified curtain command (segmented if long) and write it to FF01."""
+        await self._ensure_ff02()
+        frames = wrap_magichome_segments(
+            command.payload, self._sequence.next(), command_family=command.cmd_id
+        )
+        await self.send_frames(frames, note=note)
+
+    async def _curtain_ensure_on(self) -> None:
+        """Send power on first if the last known state is off."""
+        if self.state is not None and self.state.power is False:
+            await self._send_curtain(curtain_c2.power(True), "curtain power on")
+            await asyncio.sleep(0.15)
+
+    async def _set_curtain_rgb(self, red: int, green: int, blue: int, brightness: int) -> None:
+        command = curtain_c2.color_rgb(red, green, blue, brightness)
+        await self._curtain_ensure_on()
+        await self._send_curtain(command, "curtain color")
+        self._curtain_rgb = (red, green, blue)
+        self._curtain_percent = brightness
+        self.state = LightState(
+            power=True,
+            rgb=(red, green, blue),
+            brightness=round(brightness * 255 / 100),
+            white=0,
+            assumed=True,
+            mode=curtain_c2.MODE_COLOR,
+        )
+
+    async def _set_curtain_brightness(self, brightness: int) -> None:
+        """Brightness is part of every command: resend the active color, effect or animation."""
+        state = self.state
+        if state is not None and state.mode == curtain_c2.MODE_SCENE and state.effect:
+            await self.set_effect(state.effect, state.speed or 50, brightness)
+        elif state is not None and state.mode == curtain_c2.MODE_DIY:
+            play_mode = state.play_mode
+            if play_mode is None:
+                play_mode = curtain_c2.DEFAULT_PLAY_MODE
+            await self.play_animation(play_mode, state.speed or 50, brightness)
+        else:
+            red, green, blue = self._curtain_rgb or (255, 255, 255)
+            await self._set_curtain_rgb(red, green, blue, brightness)
+
+    async def set_effect(self, effect_id: int, speed: int = 50, brightness: int = 100) -> None:
+        """Start a built-in curtain effect (``E0 02``). Effects 1 and 10 are verified."""
+        self._require_curtain()
+        speed = max(1, min(100, speed))
+        brightness = max(1, min(100, brightness))
+        command = curtain_c2.effect(effect_id, speed, brightness)
+        await self._curtain_ensure_on()
+        await self._send_curtain(command, "curtain effect")
+        self._curtain_percent = brightness
+        self.state = LightState(
+            power=True,
+            brightness=round(brightness * 255 / 100),
+            assumed=True,
+            mode=curtain_c2.MODE_SCENE,
+            effect=effect_id,
+            speed=speed,
+        )
+
+    async def play_animation(
+        self,
+        mode: int = curtain_c2.DEFAULT_PLAY_MODE,
+        speed: int = 50,
+        brightness: int = 100,
+    ) -> None:
+        """Play the uploaded animation (``E2 09``): mode 0 and 1 loop, 2 and up hold frame 1."""
+        self._require_curtain()
+        speed = max(1, min(100, speed))
+        brightness = max(1, min(100, brightness))
+        command = curtain_c2.play(mode, speed, brightness)
+        await self._curtain_ensure_on()
+        await self._send_curtain(command, "curtain play")
+        self._curtain_percent = brightness
+        self.state = LightState(
+            power=True,
+            brightness=round(brightness * 255 / 100),
+            assumed=True,
+            mode=curtain_c2.MODE_DIY,
+            play_mode=mode,
+            speed=speed,
+        )
 
     async def upload_steps(
         self,
@@ -780,6 +896,20 @@ class LightClient:
         """Upload buffer-order 20 x 20 frames (at most 128) to the device flash."""
         steps = curtain_c2.build_upload(frames)
         await self.upload_steps(steps, ack_timeout=ack_timeout, progress=progress)
+
+    async def upload_curtain_animation(
+        self,
+        frames: list[list[tuple[int, int, int]]],
+        *,
+        mode: int = curtain_c2.DEFAULT_PLAY_MODE,
+        speed: int = 50,
+        brightness: int = 100,
+        ack_timeout: float = 4.0,
+    ) -> None:
+        """Upload frames to flash, then play them. For a resolved curtain only."""
+        self._require_curtain()
+        await self.upload_frames(frames, ack_timeout=ack_timeout)
+        await self.play_animation(mode, speed, brightness)
 
     async def _drain_upload_replies(
         self, wait_seconds: float, report: Callable[[str], None]

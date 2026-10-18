@@ -542,3 +542,88 @@ def test_play_defaults_to_the_app_mode_1() -> None:
     assert curtain_c2.play() == (bytes.fromhex("e20901326400"), 0x0A)
     assert curtain_c2.play(speed=75).payload == bytes.fromhex("e209014b6400")
 
+
+# ---------------------------------------------------------------------------
+# Home Assistant helpers
+# ---------------------------------------------------------------------------
+
+
+def test_effect_names_round_trip() -> None:
+    names = curtain_c2.effect_list()
+    assert names[0] == "Animation (uploaded)"
+    assert names[1:3] == ["Effect 1", "Effect 2"]
+    assert len(names) == curtain_c2.CURTAIN_EFFECT_COUNT + 1
+    assert curtain_c2.effect_id_from_name("Effect 10") == 10
+    for bad in ("Effect 0", "Effect 101", "Effect x", "Animation (uploaded)", "effect 1"):
+        with pytest.raises(ValueError):
+            curtain_c2.effect_id_from_name(bad)
+
+
+@pytest.mark.parametrize(
+    ("mode", "effect_id", "name"),
+    [
+        (0x67, 10, "Effect 10"),
+        (0x67, 0, None),
+        (0x67, 101, None),
+        (0x74, 1, "Animation (uploaded)"),
+        (0x66, 10, None),
+        (0x62, 1, None),
+        (None, None, None),
+    ],
+)
+def test_effect_name_for_state(mode: int | None, effect_id: int | None, name: str | None) -> None:
+    assert curtain_c2.effect_name_for_state(mode, effect_id) == name
+
+
+def test_check_upload_reply_messages() -> None:
+    curtain_c2.check_upload_reply(curtain_c2.UploadReply(1, 0))
+    with pytest.raises(curtain_c2.CurtainUploadError, match="too big for device memory"):
+        curtain_c2.check_upload_reply(curtain_c2.UploadReply(1, 2))
+    with pytest.raises(curtain_c2.CurtainUploadError, match=r"EA 03 \(frame 4\): status 0x05"):
+        curtain_c2.check_upload_reply(curtain_c2.UploadReply(3, 5, 4))
+    assert issubclass(curtain_c2.CurtainUploadError, RuntimeError)
+
+
+def test_frame_to_image_inverts_image_to_frame() -> None:
+    rng = random.Random(7)
+    pixels = [(rng.randrange(256), rng.randrange(256), rng.randrange(256)) for _ in range(400)]
+    for side in ("left", "right"):
+        for flip in (False, True):
+            frame = curtain_c2.image_to_frame(pixels, controller_side=side, flip=flip)
+            assert curtain_c2.frame_to_image(frame, controller_side=side, flip=flip) == pixels
+    with pytest.raises(ValueError):
+        curtain_c2.frame_to_image([RED] * 399)
+
+
+def test_render_preview_png_is_200_by_200_nearest() -> None:
+    from PIL import Image
+
+    pixels = [(0, 0, 0)] * 400
+    pixels[0] = RED
+    pixels[399] = BLUE
+    import io
+
+    image = Image.open(io.BytesIO(curtain_c2.render_preview_png(pixels))).convert("RGB")
+    assert image.size == (200, 200)
+    assert image.getpixel((0, 0)) == RED
+    assert image.getpixel((9, 9)) == RED  # each LED is a 10 x 10 block
+    assert image.getpixel((10, 0)) == (0, 0, 0)
+    assert image.getpixel((199, 199)) == BLUE
+    with pytest.raises(ValueError):
+        curtain_c2.render_preview_png([RED] * 399)
+
+
+def test_load_image_frames_accepts_a_file_object_and_can_stop_early(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    import io
+
+    pytest.importorskip("PIL")
+    path = tmp_path / "anim.gif"
+    _make_gif(path, [(255, 0, 0), (0, 255, 0), (0, 0, 255)])
+    data = path.read_bytes()
+    loaded = curtain_c2.load_image_frames(io.BytesIO(data), max_frames=2, count_all=False)
+    assert len(loaded.frames) == 2
+    assert loaded.total == 3  # one more than max_frames: "more than 2"
+    full = curtain_c2.load_image_frames(io.BytesIO(data), max_frames=3, count_all=False)
+    assert (len(full.frames), full.total) == (3, 3)
+    with pytest.raises(ValueError, match="not a readable image"):
+        curtain_c2.load_image_frames(io.BytesIO(b"nope"))

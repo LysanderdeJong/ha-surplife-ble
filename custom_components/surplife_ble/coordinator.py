@@ -6,6 +6,7 @@ import asyncio
 import logging
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from bleak.backends.device import BLEDevice
@@ -19,6 +20,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import UPDATE_INTERVAL
+from .core import curtain_c2
 from .core.client import LightClient
 from .core.models import LightState, apply_assumed_rgb, rgb_state_matches
 
@@ -57,6 +59,11 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
         self._assumed_rgb_brightness: int | None = None
         self._assumed_rgb_deadline: float | None = None
         self._confirmation_generation = 0
+        # IOTBT curtain only: kept in memory for the Screen entities.
+        self.animation_title: str | None = None
+        self.preview_png: bytes | None = None
+        self.preview_updated: datetime | None = None
+        self._last_animation_speed: int = 50
 
     def async_set_ble_device(
         self, device: BLEDevice, advertisement: AdvertisementData | None
@@ -131,6 +138,35 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
             self._assumed_rgb_brightness,
         )
 
+    @property
+    def is_curtain(self) -> bool:
+        """True once the connected device is resolved as an IOTBT curtain (product 0xC2)."""
+        return bool(self.client and self.client.is_curtain)
+
+    def _apply_curtain_assumed(self, state: LightState) -> LightState:
+        """Add the color and brightness the curtain never reports.
+
+        The last command sent is used: brightness always, and the color only while the
+        device reports color mode. Effects and animations carry no color.
+        """
+        client = self.client
+        if client is None or not client.is_curtain:
+            return state
+        if state.mode == curtain_c2.MODE_DIY and state.speed:
+            self._last_animation_speed = state.speed
+        percent = client.curtain_percent
+        if percent is not None:
+            state.brightness = round(percent * 255 / 100)
+            state.assumed = True
+        if (
+            state.mode == curtain_c2.MODE_COLOR
+            and client.curtain_rgb is not None
+            and percent is not None
+        ):
+            state.rgb = client.curtain_rgb
+            state.white = 0
+        return state
+
     async def _refresh_after_assumed_deadline(self, deadline: float) -> None:
         await asyncio.sleep(max(0, deadline - asyncio.get_running_loop().time()))
         if self._assumed_rgb_deadline == deadline:
@@ -161,6 +197,7 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
                 if not client.resolution or not client.resolution.repeatable:
                     raise UpdateFailed("device state response could not be repeated")
                 state = self._reconcile_assumed_rgb(state)
+                state = self._apply_curtain_assumed(state)
                 if not self._was_available:
                     _LOGGER.info("Surplife BLE device %s is now available", self.address)
                     self._was_available = True
@@ -215,6 +252,9 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
         state = await self._async_command(
             "set_rgb", *rgb, brightness=max(1, round(brightness / 255 * 100))
         )
+        if self.is_curtain:
+            self._request_confirmation()
+            return
         if state.assumed and state.rgb is not None and state.brightness is not None:
             self._assumed_rgb = state.rgb
             self._assumed_rgb_brightness = state.brightness
@@ -238,6 +278,9 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
         state = await self._async_command(
             "set_brightness", max(1, round(brightness / 255 * 100))
         )
+        if self.is_curtain:
+            self._request_confirmation()
+            return
         if state.assumed:
             if not state.white and state.rgb is not None and state.brightness is not None:
                 self._assumed_rgb = state.rgb
@@ -250,6 +293,96 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
             self._request_confirmation()
         else:
             self._clear_assumed_rgb()
+
+    def _curtain_speed(self) -> int:
+        """Reuse the speed the device reports for an effect or animation, else 50."""
+        state = self.data
+        if state is not None and state.speed:
+            return max(1, min(100, state.speed))
+        return 50
+
+    def curtain_percent(self, brightness_percent: int | None = None) -> int:
+        """Use ``brightness_percent``, else the last brightness sent, else full."""
+        if brightness_percent is not None:
+            return max(1, min(100, brightness_percent))
+        client = self.client
+        return client.curtain_percent if client and client.curtain_percent else 100
+
+    def _curtain_play_mode(self) -> int:
+        """Keep the play mode the device reports while an animation plays, else mode 1."""
+        state = self.data
+        if state is not None and state.mode == curtain_c2.MODE_DIY and state.play_mode is not None:
+            return state.play_mode
+        return curtain_c2.DEFAULT_PLAY_MODE
+
+    @property
+    def animation_speed(self) -> int:
+        """Speed of the playing animation, or the last one seen or sent (default 50)."""
+        state = self.data
+        if state is not None and state.mode == curtain_c2.MODE_DIY and state.speed:
+            return state.speed
+        return self._last_animation_speed
+
+    async def async_set_effect(
+        self, effect_id: int, brightness_percent: int | None = None
+    ) -> None:
+        """Start a built-in curtain effect."""
+        await self._async_command(
+            "set_effect",
+            effect_id,
+            self._curtain_speed(),
+            self.curtain_percent(brightness_percent),
+        )
+        self._request_confirmation()
+
+    async def async_play_animation(
+        self,
+        mode: int | None = None,
+        speed: int | None = None,
+        brightness_percent: int | None = None,
+    ) -> None:
+        """Play the animation stored in the curtain's flash (``E2 09``).
+
+        Mode 0 and 1 loop all frames and mode 2 and up hold frame 1. Missing arguments
+        keep the current play mode and speed, and the last brightness.
+        """
+        speed = speed if speed is not None else self.animation_speed
+        self._last_animation_speed = speed
+        await self._async_command(
+            "play_animation",
+            mode if mode is not None else self._curtain_play_mode(),
+            speed,
+            self.curtain_percent(brightness_percent),
+        )
+        self._request_confirmation()
+
+    async def async_upload_animation(
+        self,
+        frames: list[list[tuple[int, int, int]]],
+        *,
+        mode: int,
+        speed: int,
+        brightness_percent: int,
+        title: str | None = None,
+        preview_png: bytes | None = None,
+    ) -> None:
+        """Write frames to the curtain's flash and play them. This wears the flash.
+
+        ``title`` and ``preview_png`` are kept in memory for the Screen entities.
+        """
+        await self._async_command(
+            "upload_curtain_animation",
+            frames,
+            mode=mode,
+            speed=speed,
+            brightness=brightness_percent,
+        )
+        self._last_animation_speed = speed
+        self.animation_title = title
+        self.preview_png = preview_png
+        self.preview_updated = datetime.now(UTC)
+        self._request_confirmation()
+        self.async_update_listeners()
 
     async def async_disconnect(self) -> None:
         if self.client:

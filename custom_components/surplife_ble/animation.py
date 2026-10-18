@@ -1,0 +1,242 @@
+"""Shared pipeline that turns an image or GIF into an uploaded curtain animation.
+
+Used by the ``surplife_ble.upload_animation`` service and the Screen media player. Every
+upload writes the device flash, so avoid calling it at a high rate.
+"""
+
+from __future__ import annotations
+
+import io
+from dataclasses import dataclass
+from functools import partial
+from pathlib import Path
+from typing import TYPE_CHECKING
+from urllib.parse import urlparse
+
+from homeassistant.components import media_source
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.network import get_url
+
+from .core import curtain_c2
+
+if TYPE_CHECKING:
+    from homeassistant.core import HomeAssistant
+
+    from .coordinator import SurplifeCoordinator
+
+MAX_SOURCE_BYTES = 5 * 1024 * 1024
+_DOWNLOAD_CHUNK = 64 * 1024
+# media_type values accepted by the Screen media player besides image/*.
+_PLAIN_MEDIA_TYPES = {"url", "image", "animation"}
+
+
+class AnimationError(HomeAssistantError):
+    """A clear, user-facing animation error."""
+
+
+@dataclass(frozen=True, slots=True)
+class AnimationSource:
+    """The raw bytes of an image file and a short name for it."""
+
+    data: bytes
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class DecodedAnimation:
+    """Buffer-order frames ready to upload, and a PNG preview of the first frame."""
+
+    frames: list[list[curtain_c2.RGB]]
+    preview_png: bytes
+
+
+def decode_animation(
+    data: bytes,
+    *,
+    resample: str = "box",
+    max_frames: int = curtain_c2.MAX_UPLOAD_FRAMES,
+    controller_side: str = "left",
+    flip: bool = False,
+) -> DecodedAnimation:
+    """Decode image bytes into curtain frames and a preview. Blocking: run in an executor.
+
+    Raises :class:`AnimationError` for unreadable images and for more than ``max_frames``
+    frames (the device holds at most 128).
+    """
+    if not 1 <= max_frames <= curtain_c2.MAX_UPLOAD_FRAMES:
+        raise AnimationError(
+            f"max_frames must be between 1 and {curtain_c2.MAX_UPLOAD_FRAMES}"
+        )
+    try:
+        loaded = curtain_c2.load_image_frames(
+            io.BytesIO(data),
+            resample=resample,
+            max_frames=max_frames,
+            controller_side=controller_side,
+            flip=flip,
+            count_all=False,
+        )
+        if loaded.total > max_frames:
+            raise AnimationError(
+                f"too many frames: the animation has more than {max_frames} frames "
+                f"(the curtain holds at most {curtain_c2.MAX_UPLOAD_FRAMES}). "
+                "Use fewer frames or a lower frame rate."
+            )
+        preview = curtain_c2.render_preview_png(
+            curtain_c2.frame_to_image(
+                loaded.frames[0], controller_side=controller_side, flip=flip
+            )
+        )
+    except AnimationError:
+        raise
+    except (ValueError, RuntimeError) as err:
+        raise AnimationError(str(err)) from err
+    return DecodedAnimation(loaded.frames, preview)
+
+
+def _read_file(path: str) -> bytes:
+    file = Path(path)
+    try:
+        size = file.stat().st_size
+        if size > MAX_SOURCE_BYTES:
+            raise AnimationError(
+                f"{file.name} is too large ({size} bytes, the limit is {MAX_SOURCE_BYTES})"
+            )
+        return file.read_bytes()
+    except FileNotFoundError as err:
+        raise AnimationError(f"file not found: {path}") from err
+    except OSError as err:
+        raise AnimationError(f"cannot read {path}: {err}") from err
+
+
+async def _async_read_path(
+    hass: HomeAssistant, path: str, *, check_allowed: bool = True
+) -> AnimationSource:
+    if check_allowed and not hass.config.is_allowed_path(path):
+        raise AnimationError(
+            f"{path} is not in an allowed directory. Add it to allowlist_external_dirs "
+            "or use a media source."
+        )
+    data = await hass.async_add_executor_job(_read_file, path)
+    return AnimationSource(data, Path(path).name)
+
+
+async def _async_read_url(hass: HomeAssistant, url: str) -> AnimationSource:
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise AnimationError("url must start with http:// or https://")
+    session = async_get_clientsession(hass)
+    try:
+        async with session.get(url) as response:
+            if response.status != 200:
+                raise AnimationError(f"download failed with HTTP status {response.status}")
+            length = response.headers.get("Content-Length")
+            if length and length.isdigit() and int(length) > MAX_SOURCE_BYTES:
+                raise AnimationError(
+                    f"the download is too large ({length} bytes, the limit is "
+                    f"{MAX_SOURCE_BYTES})"
+                )
+            data = bytearray()
+            async for chunk in response.content.iter_chunked(_DOWNLOAD_CHUNK):
+                data.extend(chunk)
+                if len(data) > MAX_SOURCE_BYTES:
+                    raise AnimationError(
+                        f"the download is too large (the limit is {MAX_SOURCE_BYTES} bytes)"
+                    )
+    except AnimationError:
+        raise
+    except Exception as err:  # network errors from aiohttp or the OS
+        raise AnimationError(f"could not download {url}: {err}") from err
+    name = Path(parsed.path).name or parsed.netloc
+    return AnimationSource(bytes(data), name)
+
+
+async def async_read_source(
+    hass: HomeAssistant, *, path: str | None = None, url: str | None = None
+) -> AnimationSource:
+    """Read an image from an allowed local path or download it from a URL (5 MB cap)."""
+    if bool(path) == bool(url):
+        raise AnimationError("provide exactly one of path or url")
+    if path:
+        return await _async_read_path(hass, path)
+    assert url is not None
+    return await _async_read_url(hass, url)
+
+
+def is_supported_media_type(media_type: str | None) -> bool:
+    """True for image/* and the plain types url, image and animation."""
+    if not media_type:
+        return False
+    media_type = media_type.lower()
+    return media_type.startswith("image/") or media_type in _PLAIN_MEDIA_TYPES
+
+
+async def async_resolve_media(
+    hass: HomeAssistant, media_id: str, entity_id: str | None = None
+) -> AnimationSource:
+    """Resolve a media-source ID, http(s) URL or allowed local path to image bytes."""
+    if media_source.is_media_source_id(media_id):
+        try:
+            play = await media_source.async_resolve_media(hass, media_id, entity_id)
+        except Exception as err:  # media_source raises its own error types
+            raise AnimationError(f"cannot resolve media {media_id}: {err}") from err
+        name = Path(media_id.split("?")[0]).name or media_id
+        local_path = getattr(play, "path", None)
+        if local_path:
+            source = await _async_read_path(hass, str(local_path), check_allowed=False)
+            return AnimationSource(source.data, name)
+        url = play.url
+        if url.startswith("/"):
+            url = get_url(hass, allow_external=False) + url
+        source = await _async_read_url(hass, url)
+        return AnimationSource(source.data, name)
+    if media_id.startswith(("http://", "https://")):
+        return await _async_read_url(hass, media_id)
+    return await _async_read_path(hass, media_id)
+
+
+async def async_upload(
+    hass: HomeAssistant,
+    coordinator: SurplifeCoordinator,
+    source: AnimationSource,
+    *,
+    mode: int = curtain_c2.DEFAULT_PLAY_MODE,
+    speed: int = 50,
+    brightness: int = 100,
+    controller_side: str = "left",
+    flip: bool = False,
+    max_frames: int = curtain_c2.MAX_UPLOAD_FRAMES,
+    resample: str = "box",
+) -> int:
+    """Decode ``source``, upload it to the curtain's flash and play it. Returns the frame count.
+
+    Raises :class:`AnimationError` with a clear message if the device is not a curtain,
+    the animation has too many frames, or the device says it is too big.
+    """
+    if not coordinator.is_curtain:
+        raise AnimationError(
+            "this device is not an IOTBT curtain (product 0xC2), or it is not connected yet"
+        )
+    decoded = await hass.async_add_executor_job(
+        partial(
+            decode_animation,
+            source.data,
+            resample=resample,
+            max_frames=max_frames,
+            controller_side=controller_side,
+            flip=flip,
+        )
+    )
+    try:
+        await coordinator.async_upload_animation(
+            decoded.frames,
+            mode=mode,
+            speed=speed,
+            brightness_percent=brightness,
+            title=source.name,
+            preview_png=decoded.preview_png,
+        )
+    except (curtain_c2.CurtainUploadError, RuntimeError, ValueError, OSError, TimeoutError) as err:
+        raise AnimationError(str(err)) from err
+    return len(decoded.frames)

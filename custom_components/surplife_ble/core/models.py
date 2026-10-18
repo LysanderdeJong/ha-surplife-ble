@@ -127,6 +127,12 @@ class LightState:
     led_count: int | None = None
     assumed: bool = False
     raw_hex: str = ""
+    # IOTBT curtain (product 0xC2) only: EA 81 byte 7 mode, the built-in effect ID in
+    # scene mode, the DIY play mode, and the speed in scene or DIY mode.
+    mode: int | None = None
+    effect: int | None = None
+    play_mode: int | None = None
+    speed: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

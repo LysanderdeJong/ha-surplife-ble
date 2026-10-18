@@ -5,6 +5,7 @@ from __future__ import annotations
 import colorsys
 from dataclasses import dataclass
 
+from . import curtain_c2
 from .framing import candidate_payloads, checksum_valid, with_checksum, wrap_magichome
 from .models import LightState, ProtocolResolution
 
@@ -118,7 +119,7 @@ def classify_packet(packet: bytes) -> tuple[ProtocolResolution, bytes, str] | No
                 firmware = None
                 codec = CURTAIN_C2_CODEC
                 confidence = 0.90
-                notes.append("IOTBT symphony curtain (product 0xC2). Control remains locked.")
+                notes.append("IOTBT symphony curtain (product 0xC2).")
             elif (
                 len(candidate) >= 27
                 and candidate[5] == 0x09
@@ -218,7 +219,19 @@ def parse_state(packet: bytes) -> LightState | None:
             raw_hex=state.hex(),
         )
     if resolution.frame_family == "extended-ea81":
-        if resolution.codec in ("unresolved-ea81", CURTAIN_C2_CODEC):
+        if resolution.codec == CURTAIN_C2_CODEC:
+            curtain = curtain_c2.parse_state(state)
+            if curtain is None:
+                return None
+            return LightState(
+                power=curtain.power,
+                raw_hex=state.hex(),
+                mode=curtain.mode,
+                effect=curtain.effect,
+                play_mode=curtain.byte8 if curtain.mode == curtain_c2.MODE_DIY else None,
+                speed=curtain.speed,
+            )
+        if resolution.codec == "unresolved-ea81":
             return LightState(
                 power=state[IOTBT_POS_POWER] == POWER_ON,
                 raw_hex=state.hex(),

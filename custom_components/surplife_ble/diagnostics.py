@@ -35,6 +35,10 @@ async def async_get_config_entry_diagnostics(
             "led_count": state.led_count if state else None,
             "model_num": state.model_num if state else None,
             "firmware_version": state.firmware_version if state else None,
+            "mode": state.mode if state else None,
+            "effect": state.effect if state else None,
+            "play_mode": state.play_mode if state else None,
+            "speed": state.speed if state else None,
         },
         "resolution": {
             "codec": coordinator.client.resolution.codec

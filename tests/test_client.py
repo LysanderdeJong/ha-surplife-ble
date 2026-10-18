@@ -6,7 +6,7 @@ from typing import Any
 import pytest
 
 from custom_components.surplife_ble.core.client import LightClient
-from custom_components.surplife_ble.core.framing import with_checksum, wrap_magichome
+from custom_components.surplife_ble.core.framing import with_checksum
 from custom_components.surplife_ble.core.models import (
     LightState,
     TrafficRecord,
@@ -161,27 +161,6 @@ async def test_iotbt_set_rgb_uses_e1_03_segment_format() -> None:
         # the client keeps the commanded values as assumed state.
         assert client.state.assumed
         assert client.state.rgb == (255, 0, 0)
-
-
-@pytest.mark.asyncio
-async def test_iotbt_curtain_c2_control_stays_locked() -> None:
-    fake = FakeIotbtBleakClient()
-    # The curtain replies with a magichome2-wrapped 25-byte state. A bare 25-byte
-    # EA 81 frame would never complete in the notification reassembler.
-    fake.state = wrap_magichome(
-        bytes.fromhex("ea810100c20323620164f00000000000010190000001020300"), 1
-    )
-    client = LightClient(FakeDevice(), client_factory=lambda _device: fake)  # type: ignore[arg-type]
-    async with client:
-        resolution = await client.probe(allow_writes=True, response_timeout=0.5)
-        assert resolution is not None
-        assert resolution.codec == "iotbt-ea81-curtain-c2"
-        writes_before = len(fake.writes)
-        with pytest.raises(RuntimeError, match="locked"):
-            await client.set_power(False)
-        with pytest.raises(RuntimeError, match="locked"):
-            await client.set_rgb(255, 0, 0)
-        assert len(fake.writes) == writes_before
 
 
 @pytest.mark.asyncio

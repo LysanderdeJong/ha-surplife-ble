@@ -26,5 +26,67 @@
         }
       }
     }
+  },
+  "services": {
+    "upload_animation": {
+      "name": "Upload animation",
+      "description": "Upload an image or animated GIF to the curtain and play it. The animation is stored in the curtain's flash memory (at most 128 frames of 20x20) and keeps playing without Bluetooth. Every upload writes the flash, so do not call this often.",
+      "fields": {
+        "path": {
+          "name": "File path",
+          "description": "Local image file (PNG, JPEG, GIF or WebP). The directory must be allowed in allowlist_external_dirs. Use this or URL."
+        },
+        "url": {
+          "name": "URL",
+          "description": "http(s) address of an image or GIF, at most 5 MB. Use this or File path."
+        },
+        "speed": {
+          "name": "Speed",
+          "description": "Playback speed from 1 (slow, about 5 seconds per frame) to 100 (very fast)."
+        },
+        "brightness": {
+          "name": "Brightness",
+          "description": "Brightness from 1 to 100."
+        },
+        "mode": {
+          "name": "Play mode",
+          "description": "0 and 1 loop all frames (1 is what the Surplife app sends). 2 and up hold frame 1."
+        },
+        "controller_side": {
+          "name": "Controller side",
+          "description": "Which side of the picture the controller box hangs on. The curtain has no front or back."
+        },
+        "flip": {
+          "name": "Flip vertically",
+          "description": "Swap top and bottom."
+        },
+        "max_frames": {
+          "name": "Maximum frames",
+          "description": "Fail if the animation has more frames than this. The curtain holds at most 128."
+        },
+        "resample": {
+          "name": "Resize filter",
+          "description": "How the picture is scaled down to 20x20."
+        }
+      }
+    },
+    "play_animation": {
+      "name": "Play animation",
+      "description": "Play the animation stored in the curtain's flash memory.",
+      "fields": {
+        "mode": {
+          "name": "Play mode",
+          "description": "0 and 1 loop all frames. 2 and up hold frame 1."
+        },
+        "speed": {
+          "name": "Speed",
+          "description": "Playback speed from 1 (slow) to 100 (very fast)."
+        },
+        "brightness": {
+          "name": "Brightness",
+          "description": "Brightness from 1 to 100."
+        }
+      }
+    }
   }
 }

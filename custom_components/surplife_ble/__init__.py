@@ -12,9 +12,10 @@ if TYPE_CHECKING:
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up a Surplife BLE device from a config entry."""
     from homeassistant.components import bluetooth
-    from homeassistant.const import CONF_ADDRESS, Platform
+    from homeassistant.const import CONF_ADDRESS
     from homeassistant.core import callback
 
+    from .const import PLATFORMS
     from .coordinator import SurplifeCoordinator, SurplifeRuntimeData
 
     address = entry.data[CONF_ADDRESS]
@@ -37,7 +38,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
     )
 
-    await hass.config_entries.async_forward_entry_setups(entry, [Platform.LIGHT])
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_create_background_task(
         hass,
         coordinator.async_refresh(),
@@ -48,10 +49,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload the entity and close any BLE connection."""
-    from homeassistant.const import Platform
+    from .const import PLATFORMS
 
-    if unload_ok := await hass.config_entries.async_unload_platforms(
-        entry, [Platform.LIGHT]
-    ):
+    if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         await entry.runtime_data.coordinator.async_disconnect()
     return unload_ok

@@ -111,7 +111,7 @@ def test_iotbt_curtain_c2_classification_and_power(key: str, power: bool) -> Non
     assert resolution.capabilities == {"power", "extended-state"}
     assert "rgb" not in resolution.capabilities
     assert "brightness" not in resolution.capabilities
-    assert any("Control remains locked" in note for note in resolution.notes)
+    assert any("product 0xC2" in note for note in resolution.notes)
 
     state = parse_state(packet)
     assert state is not None

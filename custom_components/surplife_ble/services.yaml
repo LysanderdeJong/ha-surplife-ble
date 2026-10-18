@@ -1,0 +1,89 @@
+upload_animation:
+  target:
+    entity:
+      integration: surplife_ble
+      domain: light
+  fields:
+    path:
+      example: /config/www/animations/fire.gif
+      selector:
+        text:
+    url:
+      example: https://example.com/fire.gif
+      selector:
+        text:
+    speed:
+      default: 50
+      selector:
+        number:
+          min: 1
+          max: 100
+          mode: slider
+    brightness:
+      default: 100
+      selector:
+        number:
+          min: 1
+          max: 100
+          mode: slider
+    mode:
+      default: 1
+      selector:
+        number:
+          min: 0
+          max: 255
+          mode: box
+    controller_side:
+      default: left
+      selector:
+        select:
+          options:
+            - left
+            - right
+    flip:
+      default: false
+      selector:
+        boolean:
+    max_frames:
+      default: 128
+      selector:
+        number:
+          min: 1
+          max: 128
+          mode: box
+    resample:
+      default: box
+      selector:
+        select:
+          options:
+            - nearest
+            - box
+            - lanczos
+
+play_animation:
+  target:
+    entity:
+      integration: surplife_ble
+      domain: light
+  fields:
+    mode:
+      default: 1
+      selector:
+        number:
+          min: 0
+          max: 255
+          mode: box
+    speed:
+      default: 50
+      selector:
+        number:
+          min: 1
+          max: 100
+          mode: slider
+    brightness:
+      default: 100
+      selector:
+        number:
+          min: 1
+          max: 100
+          mode: slider

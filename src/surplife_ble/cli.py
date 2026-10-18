@@ -315,7 +315,7 @@ def _add_curtain_parsers(subparsers: argparse._SubParsersAction) -> None:  # typ
         description=(
             "Send verified commands to an IOTBT437-style curtain light and print the "
             "decoded EA 81 state. Writes only to FF01 and never touches the OTA service. "
-            "Home Assistant control for this codec stays locked."
+            "Home Assistant controls the same device through the integration."
         ),
     )
     sub = curtain.add_subparsers(dest="curtain_command", required=True)
