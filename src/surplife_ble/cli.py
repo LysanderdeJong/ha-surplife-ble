@@ -8,8 +8,10 @@ import json
 import sys
 from collections.abc import Awaitable, Callable
 
+from custom_components.surplife_ble.core import curtain_c2
 from custom_components.surplife_ble.core.capture import JsonlCapture, load_replay, write_json
 from custom_components.surplife_ble.core.client import LightClient
+from custom_components.surplife_ble.core.framing import wrap_magichome_segments
 from custom_components.surplife_ble.core.hci import (
     att_to_traffic_records,
     build_handle_to_uuid,
@@ -30,11 +32,31 @@ from custom_components.surplife_ble.core.statediff import (
     generate_recommendations,
 )
 
+CURTAIN_RESPONSE_TIMEOUT = 1.5
+UPLOAD_ACK_TIMEOUT = 4.0
+
 
 def _positive_float(value: str) -> float:
     parsed = float(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError("value must be positive")
+    return parsed
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("value must be at least 1")
+    return parsed
+
+
+def _max_frames(value: str) -> int:
+    parsed = _positive_int(value)
+    if parsed > curtain_c2.MAX_UPLOAD_FRAMES:
+        raise argparse.ArgumentTypeError(
+            f"the device holds at most {curtain_c2.MAX_UPLOAD_FRAMES} frames "
+            f"({curtain_c2.MAX_UPLOAD_BYTES} bytes at 20x20)"
+        )
     return parsed
 
 
@@ -227,7 +249,179 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_device(shell)
     shell.add_argument("--jsonl", help="append a traffic transcript")
+
+    _add_curtain_parsers(subparsers)
     return parser
+
+
+def _hsv(value: str) -> tuple[int, int]:
+    try:
+        parts = tuple(int(item.strip()) for item in value.split(","))
+    except ValueError as err:
+        raise argparse.ArgumentTypeError("HSV must be formatted H,S") from err
+    if len(parts) != 2 or not 0 <= parts[0] <= 359 or not 0 <= parts[1] <= 100:
+        raise argparse.ArgumentTypeError("H must be 0-359 and S must be 0-100")
+    return parts  # type: ignore[return-value]
+
+
+def _solid_colors(value: str) -> list[tuple[int, int, int]]:
+    return [_rgb(item) for item in value.split(";") if item.strip()]
+
+
+def _byte(value: str) -> int:
+    parsed = int(value, 0)
+    if not 0 <= parsed <= 255:
+        raise argparse.ArgumentTypeError("value must be from 0 to 255")
+    return parsed
+
+
+def _add_play_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--mode",
+        type=_byte,
+        default=1,
+        help="play mode (default 1, what the Surplife app sends; 0 also loops all frames)",
+    )
+    parser.add_argument(
+        "--speed",
+        type=_percentage,
+        default=50,
+        help="0-100; 0-10 is about 5 s per frame, 50 about 0.5-1 s, 100 very fast (default 50)",
+    )
+    parser.add_argument("--brightness", type=_percentage, default=100, help="0-100 (default 100)")
+
+
+def _add_curtain_options(parser: argparse.ArgumentParser) -> None:
+    _add_device(parser)
+    parser.add_argument(
+        "--allow-curtain-c2",
+        action="store_true",
+        required=True,
+        help="confirm that the target is an IOTBT curtain (product 0xC2) and writes are allowed",
+    )
+    parser.add_argument("--jsonl", help="append a traffic transcript to this path")
+    parser.add_argument(
+        "--response-timeout",
+        type=_positive_float,
+        default=CURTAIN_RESPONSE_TIMEOUT,
+        help="seconds to wait for the EA 81 state notification (default 1.5)",
+    )
+
+
+def _add_curtain_parsers(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+    curtain = subparsers.add_parser(
+        "curtain",
+        help="hardware-verified test commands for the IOTBT curtain (product 0xC2)",
+        description=(
+            "Send verified commands to an IOTBT437-style curtain light and print the "
+            "decoded EA 81 state. Writes only to FF01 and never touches the OTA service. "
+            "Home Assistant control for this codec stays locked."
+        ),
+    )
+    sub = curtain.add_subparsers(dest="curtain_command", required=True)
+
+    state = sub.add_parser("state", help="query and print the decoded EA 81 state")
+    _add_curtain_options(state)
+    on = sub.add_parser("on", help="turn the curtain on")
+    _add_curtain_options(on)
+    off = sub.add_parser("off", help="turn the curtain off")
+    _add_curtain_options(off)
+
+    color = sub.add_parser(
+        "color",
+        help="set a whole-curtain color (3B A1); brightness is resent with the color",
+    )
+    _add_curtain_options(color)
+    group = color.add_mutually_exclusive_group(required=True)
+    group.add_argument("--rgb", type=_rgb, help="R,G,B with channels 0-255")
+    group.add_argument("--hsv", type=_hsv, help="H,S with hue 0-359 and saturation 0-100")
+    color.add_argument("--brightness", type=_percentage, default=100, help="0-100 (default 100)")
+
+    effect = sub.add_parser("effect", help="start a built-in effect (E0 02)")
+    _add_curtain_options(effect)
+    effect.add_argument(
+        "--id",
+        dest="effect_id",
+        required=True,
+        type=_byte,
+        help="effect ID 0-255 (verified: 1 color cycle, 10 per-pixel multi-color pattern)",
+    )
+    effect.add_argument("--speed", type=_percentage, default=50, help="0-100 (default 50)")
+    effect.add_argument("--brightness", type=_percentage, default=100, help="0-100 (default 100)")
+
+    play = sub.add_parser(
+        "play",
+        help="play the uploaded animation (E2 09); the last play command survives power cycles",
+    )
+    _add_curtain_options(play)
+    _add_play_options(play)
+
+    upload = sub.add_parser(
+        "upload",
+        help="upload frames to device flash (EA 01..04), then play them",
+        description=(
+            "Upload one or more 20x20 frames to the curtain and play them. The upload is "
+            "stored in flash and survives power cycles. Needs --allow-flash-write."
+        ),
+    )
+    _add_curtain_options(upload)
+    upload.add_argument(
+        "--allow-flash-write",
+        action="store_true",
+        required=True,
+        help="confirm that writing the animation to device flash is intended",
+    )
+    source = upload.add_mutually_exclusive_group(required=True)
+    source.add_argument(
+        "--solid",
+        type=_solid_colors,
+        help="R,G,B[;R,G,B...] one solid frame per color",
+    )
+    source.add_argument(
+        "--image",
+        help="PNG, JPEG, GIF or WebP file (all frames of animated images); needs Pillow",
+    )
+    upload.add_argument(
+        "--resample",
+        choices=("nearest", "box", "lanczos"),
+        default="box",
+        help="filter for resizing to 20x20 (default box)",
+    )
+    upload.add_argument(
+        "--max-frames",
+        type=_max_frames,
+        default=curtain_c2.MAX_UPLOAD_FRAMES,
+        help=(
+            f"keep at most this many frames, with a warning (default and limit "
+            f"{curtain_c2.MAX_UPLOAD_FRAMES}: the device rejects more than "
+            f"{curtain_c2.MAX_UPLOAD_BYTES} bytes)"
+        ),
+    )
+    upload.add_argument(
+        "--controller-side",
+        choices=("left", "right"),
+        default="left",
+        help=(
+            "side of the image where the controller box hangs (default left): image column "
+            "x=0 maps to the controller-side string; with right, x -> 19-x"
+        ),
+    )
+    upload.add_argument(
+        "--mirror",
+        action="store_true",
+        help="alias that flips the --controller-side choice (left <-> right)",
+    )
+    upload.add_argument("--flip", action="store_true", help="swap top and bottom (y -> 19 - y)")
+    upload.add_argument(
+        "--no-play", action="store_true", help="upload only; do not send the play command"
+    )
+    upload.add_argument(
+        "--ack-timeout",
+        type=_positive_float,
+        default=UPLOAD_ACK_TIMEOUT,
+        help="seconds to wait for each acked step before aborting (default 4)",
+    )
+    _add_play_options(upload)
 
 
 async def _device_client(args: argparse.Namespace) -> LightClient:
@@ -304,6 +498,145 @@ async def _control(args: argparse.Namespace) -> int:
             await client.set_brightness(max(1, args.value))
         print(json.dumps(client.state.to_dict() if client.state else {}, indent=2))
     return 0
+
+
+def _curtain_command(args: argparse.Namespace) -> curtain_c2.CurtainCommand | None:
+    """Build the inner command for a `curtain` subcommand (None for `state`)."""
+    name = args.curtain_command
+    if name == "state":
+        return None
+    if name == "on":
+        return curtain_c2.power(True)
+    if name == "off":
+        return curtain_c2.power(False)
+    if name == "color":
+        if args.hsv is not None:
+            return curtain_c2.color_hsv(*args.hsv, args.brightness)
+        return curtain_c2.color_rgb(*args.rgb, args.brightness)
+    if name == "effect":
+        return curtain_c2.effect(args.effect_id, args.speed, args.brightness)
+    if name == "play":
+        return curtain_c2.play(args.mode, args.speed, args.brightness)
+    raise ValueError(f"unknown curtain command: {name}")
+
+
+async def _curtain_send(client: LightClient, command: curtain_c2.CurtainCommand, note: str) -> None:
+    frames = wrap_magichome_segments(
+        command.payload,
+        client.next_sequence(),
+        command_family=command.cmd_id,
+    )
+    await client.send_frames(frames, note=note)
+
+
+async def _curtain_wait_state(
+    client: LightClient, wait_seconds: float
+) -> curtain_c2.CurtainState | None:
+    """Wait up to ``wait_seconds`` for an EA 81 state notification."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + wait_seconds
+    while (remaining := deadline - loop.time()) > 0:
+        packet = await client.wait_notification(remaining)
+        if packet is None:
+            break
+        state = curtain_c2.parse_state(packet)
+        if state is not None:
+            return state
+    return None
+
+
+async def _curtain_prepare(client: LightClient) -> None:
+    """Enumerate GATT, acquire the MTU, and subscribe to FF02 before any write."""
+    await client.inspect_gatt()
+    mtu = await client.acquire_mtu()
+    if mtu is not None:
+        print(f"ATT MTU: {mtu}", file=sys.stderr)
+    await client.subscribe_ff02()
+    client.flush_notifications()
+
+
+async def _curtain_state_or_query(
+    client: LightClient, state: curtain_c2.CurtainState | None, wait_seconds: float
+) -> curtain_c2.CurtainState | None:
+    """Return ``state`` or, if it is None, query the device and wait for the reply."""
+    if state is None:
+        client.flush_notifications()
+        await _curtain_send(client, curtain_c2.state_query(), "curtain state query")
+        state = await _curtain_wait_state(client, wait_seconds)
+    return state
+
+
+def _curtain_print_state(state: curtain_c2.CurtainState | None) -> int:
+    if state is None:
+        print("no EA 81 state received", file=sys.stderr)
+        return 2
+    print(json.dumps(state.to_dict(), indent=2))
+    print(
+        "note: color and brightness are not reported by the device; only power is reliable.",
+        file=sys.stderr,
+    )
+    return 0
+
+
+async def _curtain(args: argparse.Namespace) -> int:
+    """Run one verified curtain command and print the decoded EA 81 state."""
+    if args.curtain_command == "upload":
+        return await _curtain_upload(args)
+    command = _curtain_command(args)
+    client = await _device_client(args)
+    async with client:
+        await _curtain_prepare(client)
+        state = None
+        if command is not None:
+            await _curtain_send(client, command, f"curtain {args.curtain_command}")
+            state = await _curtain_wait_state(client, args.response_timeout)
+        state = await _curtain_state_or_query(client, state, args.response_timeout)
+    return _curtain_print_state(state)
+
+
+def _upload_frames(
+    args: argparse.Namespace,
+) -> tuple[list[list[curtain_c2.RGB]], str]:
+    """Build the buffer-order frames for `curtain upload` and a short source label."""
+    if args.solid is not None:
+        return [curtain_c2.solid_frame(color) for color in args.solid], "solid colors"
+    loaded = curtain_c2.load_image_frames(
+        args.image,
+        resample=args.resample,
+        max_frames=args.max_frames,
+        controller_side=args.controller_side,
+        mirror=args.mirror,
+        flip=args.flip,
+    )
+    if loaded.total > len(loaded.frames):
+        print(
+            f"warning: {args.image} has {loaded.total} frames; keeping the first "
+            f"{len(loaded.frames)} (--max-frames)",
+            file=sys.stderr,
+        )
+    side = "right" if (args.controller_side == "right") != args.mirror else "left"
+    print(f"controller side: {side} (image column {'19' if side == 'right' else '0'} "
+          "is the controller-side string)")
+    return loaded.frames, args.image
+
+
+async def _curtain_upload(args: argparse.Namespace) -> int:
+    """Upload frames to device flash, then optionally play them."""
+    frames, source = _upload_frames(args)
+    steps = curtain_c2.build_upload(frames)
+    print(f"Uploading {len(frames)} frame(s) from {source} to device flash")
+    client = await _device_client(args)
+    async with client:
+        await _curtain_prepare(client)
+        await client.upload_steps(steps, ack_timeout=args.ack_timeout, progress=print)
+        state = None
+        if not args.no_play:
+            command = curtain_c2.play(args.mode, args.speed, args.brightness)
+            print(f"play: mode {args.mode} speed {args.speed} brightness {args.brightness}")
+            await _curtain_send(client, command, "curtain upload play")
+            state = await _curtain_wait_state(client, args.response_timeout)
+        state = await _curtain_state_or_query(client, state, args.response_timeout)
+    return _curtain_print_state(state)
 
 
 async def _raw_write(args: argparse.Namespace) -> int:
@@ -788,6 +1121,7 @@ async def async_main(argv: list[str] | None = None) -> int:
         "watch": _watch,
         "analyze": _analyze,
         "shell": _shell,
+        "curtain": _curtain,
     }
     return await handlers[args.command](args)
 

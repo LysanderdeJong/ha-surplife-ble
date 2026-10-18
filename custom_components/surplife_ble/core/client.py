@@ -12,8 +12,9 @@ from bleak import BleakClient
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
 
+from . import curtain_c2
 from .capture import JsonlCapture
-from .framing import NotificationReassembler, SequenceCounter
+from .framing import NotificationReassembler, SequenceCounter, wrap_magichome_segments
 from .models import (
     GattCharacteristic,
     GattProfile,
@@ -184,7 +185,7 @@ class LightClient:
             writable[0] if writable else None
         )
 
-    async def _start_notifications(self) -> None:
+    async def _start_notifications(self, only: str | None = None) -> None:
         client = self._require_client()
         assert self._profile is not None
         ordered = sorted(
@@ -193,6 +194,8 @@ class LightClient:
         )
         for characteristic in ordered:
             if characteristic.uuid in self._notifying:
+                continue
+            if only is not None and not _uuid_is(characteristic.uuid, only):
                 continue
 
             def callback(sender: Any, data: bytearray, *, uuid: str = characteristic.uuid) -> None:
@@ -284,6 +287,79 @@ class LightClient:
             framing=transport,
             note=note,
         )
+
+    # ------------------------------------------------------------------
+    # Raw-frame helpers for the `ble-rgb curtain` test commands. They skip
+    # protocol resolution on purpose and only ever touch FF01 / FF02.
+    # ------------------------------------------------------------------
+
+    async def acquire_mtu(self) -> int | None:
+        """Acquire the ATT MTU on BlueZ (bleak reports 23 until this is awaited).
+
+        Returns the MTU if the backend reports one. Other backends have no
+        ``_acquire_mtu`` and are left alone.
+        """
+        client = self._require_client()
+        acquire = getattr(getattr(client, "_backend", None), "_acquire_mtu", None)
+        if acquire is not None:
+            with suppress(Exception):
+                await acquire()
+        mtu = getattr(client, "mtu_size", None)
+        return int(mtu) if isinstance(mtu, int) else None
+
+    async def subscribe_ff02(self) -> None:
+        """Subscribe to FF02 only. Call before writing so no reply is missed."""
+        if not self.connected:
+            await self.connect()
+        await self._start_notifications(only="ff02")
+        if not any(_uuid_is(uuid, "ff02") for uuid in self._notifying):
+            raise RuntimeError("device exposes no FF02 notify characteristic")
+
+    def _ff01(self) -> GattCharacteristic:
+        assert self._profile is not None
+        target = next(
+            (item for item in self._profile.writable if _uuid_is(item.uuid, "ff01")), None
+        )
+        if target is None:
+            raise RuntimeError("device exposes no writable FF01 characteristic")
+        return target
+
+    async def send_frames(
+        self,
+        frames: list[bytes],
+        *,
+        note: str,
+        gap: float = 0.02,
+    ) -> None:
+        """Write already-framed bytes to FF01 (never to the OTA FF11 channel)."""
+        if not self.connected:
+            await self.connect()
+        target = self._ff01()
+        for index, frame in enumerate(frames):
+            await self._write(
+                frame,
+                characteristic=target,
+                framing="magichome2",
+                note=f"{note} [{index + 1}/{len(frames)}]",
+            )
+            if gap and index + 1 < len(frames):
+                await asyncio.sleep(gap)
+
+    def next_sequence(self) -> int:
+        return self._sequence.next()
+
+    def flush_notifications(self) -> None:
+        self._flush_notifications()
+
+    async def wait_notification(self, wait_seconds: float) -> bytes | None:
+        """Return the next complete notification packet, or None after ``wait_seconds``."""
+        try:
+            _uuid, packet = await asyncio.wait_for(
+                self._notifications.get(), timeout=wait_seconds
+            )
+        except TimeoutError:
+            return None
+        return packet
 
     async def _read_candidates(self) -> list[tuple[str, bytes]]:
         client = self._require_client()
@@ -651,6 +727,103 @@ class LightClient:
             return
         rgb = self.state.rgb if self.state and self.state.rgb else (255, 255, 255)
         await self.set_rgb(*rgb, brightness=brightness)
+
+    # ------------------------------------------------------------------
+    # IOTBT curtain (product 0xC2). All frames go to FF01 as MagicHome2 transport frames.
+    # ------------------------------------------------------------------
+
+    async def _ensure_ff02(self) -> None:
+        if not any(_uuid_is(uuid, "ff02") for uuid in self._notifying):
+            await self._start_notifications(only="ff02")
+
+    async def upload_steps(
+        self,
+        steps: list[curtain_c2.UploadStep],
+        *,
+        ack_timeout: float = 4.0,
+        progress: Callable[[str], None] | None = None,
+    ) -> None:
+        """Send prepared upload steps (``EA 01``..``EA 04``) and check the device replies.
+
+        This writes the animation to the device flash. It does not check the codec: the
+        caller must know the device is an IOTBT curtain.
+
+        An acked step is not followed by the next one until its reply arrives. For a
+        content frame that is ``EA 03 <u16 index> <status>`` with the index of the frame
+        just sent, so the device is never sent more than one frame at a time. Raises
+        :class:`curtain_c2.CurtainUploadError` if an acked step gets no matching reply
+        within ``ack_timeout`` seconds or any reply has a non-zero status (status 2 means
+        the upload is too big for the device).
+        """
+        report = progress or (lambda _line: None)
+        await self._ensure_ff02()
+        self._flush_notifications()
+        for step in steps:
+            segments = wrap_magichome_segments(
+                step.payload, self._sequence.next(), command_family=curtain_c2.CMD_UPLOAD
+            )
+            preview = step.payload[:16].hex() + ("..." if len(step.payload) > 16 else "")
+            report(f"{step.name}: {len(step.payload)} B in {len(segments)} frame(s) {preview}")
+            await self.send_frames(segments, note=f"curtain upload {step.name}")
+            if step.acked:
+                await self._wait_upload_ack(step, ack_timeout, report)
+            else:
+                await self._drain_upload_replies(0.05, report)
+
+    async def upload_frames(
+        self,
+        frames: list[list[tuple[int, int, int]]],
+        *,
+        ack_timeout: float = 4.0,
+        progress: Callable[[str], None] | None = None,
+    ) -> None:
+        """Upload buffer-order 20 x 20 frames (at most 128) to the device flash."""
+        steps = curtain_c2.build_upload(frames)
+        await self.upload_steps(steps, ack_timeout=ack_timeout, progress=progress)
+
+    async def _drain_upload_replies(
+        self, wait_seconds: float, report: Callable[[str], None]
+    ) -> None:
+        while (packet := await self.wait_notification(wait_seconds)) is not None:
+            reply = curtain_c2.parse_upload_reply(packet)
+            if reply is not None:
+                curtain_c2.check_upload_reply(reply)
+                report(f"  reply: EA {reply.step:02x} status {reply.status:#04x}")
+
+    async def _wait_upload_ack(
+        self,
+        step: curtain_c2.UploadStep,
+        wait_seconds: float,
+        report: Callable[[str], None],
+    ) -> None:
+        """Wait for the reply to ``step``: ``EA <step> <status>``, or ``EA 03 <index> <status>``.
+
+        A reply for another content frame does not count as the ack: it is logged and the
+        wait continues until the deadline. A non-zero status in any reply is an error.
+        """
+        expected = step.payload[1]
+        expected_index = int.from_bytes(step.payload[2:4], "big") if expected == 3 else None
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + wait_seconds
+        while (remaining := deadline - loop.time()) > 0:
+            packet = await self.wait_notification(remaining)
+            if packet is None:
+                break
+            reply = curtain_c2.parse_upload_reply(packet)
+            if reply is None:
+                continue
+            curtain_c2.check_upload_reply(reply)
+            if reply.step == expected and reply.index == expected_index:
+                report(f"  reply: EA {reply.step:02x} status {reply.status:#04x}")
+                return
+            report(
+                f"  ignoring reply EA {reply.step:02x}"
+                + (f" for frame {reply.index}" if reply.index is not None else "")
+                + f" while waiting for '{step.name}'"
+            )
+        raise curtain_c2.CurtainUploadError(
+            f"no reply to upload step '{step.name}' within {wait_seconds:g}s"
+        )
 
     async def raw_write(
         self,
