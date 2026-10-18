@@ -237,6 +237,26 @@ def install(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     class NumberSelectorMode(enum.StrEnum):
         SLIDER = "slider"
 
+    class SelectSelectorMode(enum.StrEnum):
+        DROPDOWN = "dropdown"
+
+    class SelectSelector:
+        """Like the real selector, it only accepts one of the options."""
+
+        def __init__(self, config: dict[str, Any]) -> None:
+            self.config = config
+
+        def __call__(self, value: Any) -> str:
+            if value not in self.config["options"]:
+                raise vol.Invalid(f"{value!r} is not one of the options")
+            return str(value)
+
+    class BooleanSelector:
+        def __call__(self, value: Any) -> bool:
+            if not isinstance(value, bool):
+                raise vol.Invalid("expected a boolean")
+            return value
+
     class NumberSelector:
         """Like the real selector, it rejects values outside min/max."""
 
@@ -324,9 +344,13 @@ def install(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         ),
         "homeassistant.helpers.selector": _module(
             "homeassistant.helpers.selector",
+            BooleanSelector=BooleanSelector,
             NumberSelector=NumberSelector,
             NumberSelectorConfig=lambda **kwargs: kwargs,
             NumberSelectorMode=NumberSelectorMode,
+            SelectSelector=SelectSelector,
+            SelectSelectorConfig=lambda **kwargs: kwargs,
+            SelectSelectorMode=SelectSelectorMode,
         ),
         "homeassistant.const": _module(
             "homeassistant.const", CONF_ADDRESS="address", CONF_NAME="name"

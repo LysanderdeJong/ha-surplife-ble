@@ -17,20 +17,27 @@ from homeassistant.config_entries import (
 from homeassistant.const import CONF_ADDRESS, CONF_NAME
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.selector import (
+    BooleanSelector,
     NumberSelector,
     NumberSelectorConfig,
     NumberSelectorMode,
+    SelectSelector,
+    SelectSelectorConfig,
+    SelectSelectorMode,
 )
 
 from .const import (
     CALIBRATION_OPTIONS,
     CONF_BLUE_GAIN,
+    CONF_CONTROLLER_SIDE,
+    CONF_FLIP,
     CONF_GAMMA,
     CONF_GREEN_GAIN,
     CONF_RED_GAIN,
     DOMAIN,
 )
 from .core import calibration as color_calibration
+from .core import curtain_c2
 from .core.calibration import CalibrationError, ColorCalibration
 
 # Service data UUID prefix advertised by IOTBT/Surplife BLE lights.
@@ -238,8 +245,22 @@ def _gamma_selector() -> NumberSelector:
     )
 
 
+def _controller_side_selector() -> SelectSelector:
+    return SelectSelector(
+        SelectSelectorConfig(
+            options=list(curtain_c2.CONTROLLER_SIDES),
+            mode=SelectSelectorMode.DROPDOWN,
+            translation_key=CONF_CONTROLLER_SIDE,
+        )
+    )
+
+
 class SurplifeOptionsFlow(OptionsFlow):
-    """Color calibration for the IOTBT curtain: a gain per channel and a gamma."""
+    """Options for the IOTBT curtain: how it hangs and how colors look.
+
+    The controller side and the upside-down flag are the defaults for every image upload.
+    The color calibration is a gain per channel and a gamma.
+    """
 
     def __init__(self, config_entry: ConfigEntry) -> None:
         """Keep the entry. Newer Home Assistant versions also provide config_entry."""
@@ -266,16 +287,28 @@ class SurplifeOptionsFlow(OptionsFlow):
                 )
             except CalibrationError:
                 errors["base"] = "invalid_calibration"
-            else:
+            if user_input.get(CONF_CONTROLLER_SIDE, "left") not in curtain_c2.CONTROLLER_SIDES:
+                errors["base"] = "invalid_orientation"
+            if not errors:
                 return self.async_create_entry(data=dict(user_input))
+        options = dict(self._entry.options)
         current = ColorCalibration.from_dict(
-            {k: v for k, v in dict(self._entry.options).items() if k in CALIBRATION_OPTIONS}
+            {k: v for k, v in options.items() if k in CALIBRATION_OPTIONS}
         )
-        defaults = user_input or current.to_dict()
+        defaults = {
+            CONF_CONTROLLER_SIDE: options.get(CONF_CONTROLLER_SIDE, "left"),
+            CONF_FLIP: options.get(CONF_FLIP, False),
+            **current.to_dict(),
+            **(user_input or {}),
+        }
         return self.async_show_form(
             step_id="init",
             data_schema=vol.Schema(
                 {
+                    vol.Required(
+                        CONF_CONTROLLER_SIDE, default=defaults[CONF_CONTROLLER_SIDE]
+                    ): _controller_side_selector(),
+                    vol.Required(CONF_FLIP, default=defaults[CONF_FLIP]): BooleanSelector(),
                     vol.Required(CONF_RED_GAIN, default=defaults[CONF_RED_GAIN]): _gain_selector(),
                     vol.Required(
                         CONF_GREEN_GAIN, default=defaults[CONF_GREEN_GAIN]

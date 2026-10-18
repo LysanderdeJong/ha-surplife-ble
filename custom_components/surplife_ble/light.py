@@ -166,8 +166,8 @@ class SurplifeLight(CoordinatorEntity[SurplifeCoordinator], LightEntity):
             mode=kwargs["mode"],
             speed=kwargs["speed"],
             brightness=kwargs["brightness"],
-            controller_side=kwargs["controller_side"],
-            flip=kwargs["flip"],
+            controller_side=kwargs.get("controller_side"),
+            flip=kwargs.get("flip"),
             max_frames=kwargs["max_frames"],
             resample=kwargs["resample"],
         )

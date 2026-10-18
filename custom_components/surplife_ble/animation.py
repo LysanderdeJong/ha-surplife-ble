@@ -204,12 +204,15 @@ async def async_upload(
     mode: int = curtain_c2.DEFAULT_PLAY_MODE,
     speed: int = 50,
     brightness: int = 100,
-    controller_side: str = "left",
-    flip: bool = False,
+    controller_side: str | None = None,
+    flip: bool | None = None,
     max_frames: int = curtain_c2.MAX_UPLOAD_FRAMES,
     resample: str = "box",
 ) -> int:
     """Decode ``source``, upload it to the curtain's flash and play it. Returns the frame count.
+
+    ``controller_side`` and ``flip`` default to the orientation options of the config entry.
+    A value given here overrides the option for this call.
 
     Raises :class:`AnimationError` with a clear message if the device is not a curtain,
     the animation has too many frames, or the device says it is too big.
@@ -224,8 +227,8 @@ async def async_upload(
             source.data,
             resample=resample,
             max_frames=max_frames,
-            controller_side=controller_side,
-            flip=flip,
+            controller_side=controller_side or coordinator.controller_side,
+            flip=coordinator.flip if flip is None else flip,
         )
     )
     try:

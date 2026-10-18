@@ -472,8 +472,8 @@ A curtain is one device with four entities:
   off send power off, turn on sends power on. State: off when power is off, playing for DIY
   mode with play mode 0 or 1, paused for DIY mode with play mode 2 or more, on otherwise.
 - **Screen preview** (image). A 200x200 PNG of the first frame after each upload, scaled with
-  nearest-neighbor. It shows the picture as seen, whatever the controller side. It lives in
-  memory only.
+  nearest-neighbor. It shows the picture as seen, whatever the orientation (section 12.1).
+  It lives in memory only.
 - **Animation speed** (number, 1-100). It shows byte 9 while the animation plays and the last
   known speed otherwise. Setting it sends `E2 09` with the current play mode (or 1) and the
   last brightness, which also starts the stored animation.
@@ -481,10 +481,31 @@ A curtain is one device with four entities:
 Services `surplife_ble.upload_animation` and `surplife_ble.play_animation` use the same
 upload pipeline as the Screen. See the README. Each upload writes the device flash.
 
-The options of the config entry hold the color calibration (section 13): `red_gain`,
-`green_gain`, `blue_gain` and `gamma`. It applies to the light's colors and to every image
-upload, from the service and from the Screen. It does not apply to effects, playback or other
-devices. A change in the options takes effect at once, without a reload.
+The options of the config entry hold the orientation (section 12.1) and the color calibration
+(section 13): `red_gain`, `green_gain`, `blue_gain` and `gamma`. The calibration applies to
+the light's colors and to every image upload, from the service and from the Screen. It does
+not apply to effects, playback or other devices. A change in the options takes effect at
+once, without a reload.
+
+### 12.1 Orientation
+
+The curtain has no front or back, so the controller box ends up on the left or the right,
+depending on how it is hung (see the pixel order in section 10.2). The options of the config
+entry set the default for every upload:
+
+- `controller_side` (`left` or `right`, default `left`): set it to match how the curtain is
+  hung. It is the side of the picture the controller box is on when you look at the curtain.
+  With `right`, the image columns are reversed (`x -> 19 - x`), so the picture appears upright.
+- `flip` (default off, "Upside down"): swap top and bottom (`y -> 19 - y`).
+
+They are used by the Screen media player (`play_media`), the `upload_animation` service and
+the preview. In the service, `controller_side` and `flip` are optional fields without
+defaults. A field that is given overrides the option for that call only. The code is
+`animation.async_upload`, which falls back to the coordinator's options.
+
+The preview is the source picture as the user sees it. It is built by inverting the same
+mapping that was used for the upload, so the orientation is not applied a second time and a
+mirrored upload has an unmirrored preview.
 
 ## 13. Color calibration and LED color tips
 
@@ -564,8 +585,9 @@ with unsaved changes it prints a warning.
 
 ### 13.3 Home Assistant
 
-A curtain entry has an options flow (Configure) with the four values as sliders: gains 0.0 to
-2.0 and gamma 0.2 to 4.0 in steps of 0.05. The flow is refused for devices that are known not
+A curtain entry has an options flow (Configure). It sets the orientation (section 12.1) and
+the four calibration values as sliders: gains 0.0 to 2.0 and gamma 0.2 to 4.0 in steps of
+0.05. The flow is refused for devices that are known not
 to be curtains. Use `ble-rgb curtain calibrate` to find good values first. The preview image
 shows the picture as given, before the calibration.
 

@@ -38,8 +38,9 @@ UPLOAD_SCHEMA = {
     vol.Optional(ATTR_PATH): cv.string,
     vol.Optional(ATTR_URL): cv.string,
     **PLAY_SCHEMA,
-    vol.Optional(ATTR_CONTROLLER_SIDE, default="left"): vol.In(["left", "right"]),
-    vol.Optional(ATTR_FLIP, default=False): cv.boolean,
+    # No defaults: when a field is missing, the options of the config entry apply.
+    vol.Optional(ATTR_CONTROLLER_SIDE): vol.In(["left", "right"]),
+    vol.Optional(ATTR_FLIP): cv.boolean,
     vol.Optional(ATTR_MAX_FRAMES, default=curtain_c2.MAX_UPLOAD_FRAMES): vol.All(
         vol.Coerce(int), vol.Range(min=1, max=curtain_c2.MAX_UPLOAD_FRAMES)
     ),

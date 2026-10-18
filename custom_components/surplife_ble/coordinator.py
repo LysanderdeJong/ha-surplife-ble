@@ -19,7 +19,7 @@ from homeassistant.const import CONF_ADDRESS
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .const import CALIBRATION_OPTIONS, UPDATE_INTERVAL
+from .const import CALIBRATION_OPTIONS, CONF_CONTROLLER_SIDE, CONF_FLIP, UPDATE_INTERVAL
 from .core import curtain_c2
 from .core.calibration import IDENTITY, CalibrationError, ColorCalibration
 from .core.client import LightClient
@@ -61,6 +61,7 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
         self._assumed_rgb_deadline: float | None = None
         self._confirmation_generation = 0
         self._calibration = self._load_calibration()
+        self._controller_side, self._flip = self._load_orientation()
         # IOTBT curtain only: kept in memory for the Screen entities.
         self.animation_title: str | None = None
         self.preview_png: bytes | None = None
@@ -84,9 +85,28 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
             _LOGGER.warning("Ignoring invalid color calibration options: %s", err)
             return IDENTITY
 
-    def async_update_calibration(self) -> None:
-        """Apply changed options to the connected client without reconnecting."""
+    @property
+    def controller_side(self) -> str:
+        """Which side of the picture the controller box hangs on: ``left`` or ``right``."""
+        return self._controller_side
+
+    @property
+    def flip(self) -> bool:
+        """True when the curtain hangs upside down (swap top and bottom)."""
+        return self._flip
+
+    def _load_orientation(self) -> tuple[str, bool]:
+        options = self.config_entry.options
+        side = options.get(CONF_CONTROLLER_SIDE, "left")
+        if side not in curtain_c2.CONTROLLER_SIDES:
+            _LOGGER.warning("Ignoring invalid controller side option %r", side)
+            side = "left"
+        return side, bool(options.get(CONF_FLIP, False))
+
+    def async_update_options(self) -> None:
+        """Apply changed options (calibration and orientation) without reconnecting."""
         self._calibration = self._load_calibration()
+        self._controller_side, self._flip = self._load_orientation()
         if self.client is not None:
             self.client.curtain_calibration = self._calibration
 

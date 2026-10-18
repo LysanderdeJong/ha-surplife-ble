@@ -34,14 +34,12 @@ upload_animation:
           max: 255
           mode: box
     controller_side:
-      default: left
       selector:
         select:
           options:
             - left
             - right
     flip:
-      default: false
       selector:
         boolean:
     max_frames:

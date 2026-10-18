@@ -109,8 +109,8 @@ data:
   speed: 50            # 1-100, default 50
   brightness: 100      # 1-100, default 100
   mode: 1              # default 1, see below
-  controller_side: left   # left or right, default left
-  flip: false
+  controller_side: right  # optional: left or right, overrides the device option
+  flip: false             # optional: overrides the device option
   max_frames: 128      # default and limit 128
   resample: box        # nearest, box or lanczos
 ```
@@ -131,14 +131,21 @@ data:
 | 1 | Loop all frames (constant). This is the default and what the Surplife app sends |
 | 2 and up | Hold frame 1 |
 
-**Controller side.** The curtain has no front or back. The controller box hangs on the left or
-the right. `controller_side` says which side of the picture it is on, so the picture appears
-upright. With `left`, image column 0 is the string nearest the controller. With `right`, the
-columns are reversed. `flip` swaps top and bottom.
+**Controller side and orientation.** The curtain has no front or back. The controller box
+hangs on the left or the right, and the curtain may hang upside down. Choose **Configure** on
+the curtain and set **Controller side (swap left/right)** to the side the controller is on when
+you look at the curtain (default `left`), and turn on **Upside down** if it hangs upside down.
+Every upload then comes out the right way round: the Screen media player, the
+`upload_animation` service and the preview all use these options. With `left`, image column 0
+is the string nearest the controller. With `right`, the columns are reversed, so the picture
+is mirrored for the curtain and looks upright. `flip` swaps top and bottom. The
+`controller_side` and `flip` fields of `upload_animation` are optional. When you give one, it
+overrides the device option for that call only. A change in the options takes effect at once.
+The preview image always shows the picture as you see it, not the mirrored data.
 
 **Color calibration.** The curtain stores colors in a coarse format and its LEDs differ from
-a screen: green is strong, and partly saturated colors look pale. Choose **Configure** on the
-curtain to set a gain for red, green and blue (0.0 to 2.0) and a gamma (0.2 to 4.0). The
+a screen: green is strong, and partly saturated colors look pale. On the same **Configure** page, set
+a gain for red, green and blue (0.0 to 2.0) and a gamma (0.2 to 4.0). The
 default of 1.0 changes nothing. The calibration applies to the light's colors and to every
 image the service or the Screen uploads, and takes effect at once. It does not apply to
 effects or the stored animation. Find good values with `ble-rgb curtain calibrate` (see

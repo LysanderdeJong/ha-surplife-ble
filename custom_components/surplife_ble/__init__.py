@@ -49,8 +49,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Apply changed options (the curtain color calibration) without a reload."""
-    entry.runtime_data.coordinator.async_update_calibration()
+    """Apply changed options (curtain color calibration and orientation) without a reload."""
+    entry.runtime_data.coordinator.async_update_options()
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

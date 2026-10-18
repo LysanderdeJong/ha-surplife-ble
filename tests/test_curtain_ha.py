@@ -227,11 +227,15 @@ async def test_service_schemas_validate_ranges_and_fill_defaults(ha: SimpleNames
         "mode": 1,
         "speed": 50,
         "brightness": 100,
-        "controller_side": "left",
-        "flip": False,
         "max_frames": 128,
         "resample": "box",
     }
+    # No default for the orientation: a missing field means "use the device option".
+    assert "controller_side" not in schema({"path": "/config/a.gif"})
+    assert "flip" not in schema({"path": "/config/a.gif"})
+    assert schema({"path": "/a.gif", "controller_side": "right", "flip": "true"})[
+        "controller_side"
+    ] == "right"
     assert schema({"url": "https://x/a.gif", "speed": "75", "flip": "true"})["speed"] == 75
     for bad in (
         {"speed": 0},
@@ -866,13 +870,13 @@ async def test_calibration_comes_from_the_entry_options(
     assert coordinator.calibration.is_identity
     assert coordinator.client.curtain_calibration.is_identity
     coordinator.config_entry.options = {**GREEN_HALF, "unrelated": "kept out"}
-    coordinator.async_update_calibration()
+    coordinator.async_update_options()
     assert coordinator.calibration == ColorCalibration(green_gain=0.5)
     assert coordinator.client.curtain_calibration == ColorCalibration(green_gain=0.5)
     # Invalid stored values are ignored with a warning, not applied.
     coordinator.config_entry.options = {"gamma": 9.0}
     with caplog.at_level("WARNING"):
-        coordinator.async_update_calibration()
+        coordinator.async_update_options()
     assert coordinator.calibration.is_identity
     assert "Ignoring invalid color calibration options" in caplog.text
 
@@ -997,13 +1001,17 @@ async def test_options_flow_shows_the_identity_by_default(ha: SimpleNamespace) -
     result = await flow.async_step_init()
     assert (result["type"], result["step_id"], result["errors"]) == ("form", "init", {})
     assert schema_fields(result) == {
+        "controller_side": "left",
+        "flip": False,
         "red_gain": 1.0,
         "green_gain": 1.0,
         "blue_gain": 1.0,
         "gamma": 1.0,
     }
     validators = {
-        str(key.schema): validator.config for key, validator in result["data_schema"].schema.items()
+        str(key.schema): validator.config
+        for key, validator in result["data_schema"].schema.items()
+        if hasattr(validator, "config") and "min" in validator.config
     }
     for name in ("red_gain", "green_gain", "blue_gain"):
         assert (validators[name]["min"], validators[name]["max"], validators[name]["step"]) == (
@@ -1024,6 +1032,8 @@ async def test_options_flow_defaults_follow_the_stored_options(ha: SimpleNamespa
     entry = FakeEntry({"green_gain": 0.55, "gamma": 1.4, "ignored": 1})
     result = await option_flow(ha, entry).async_step_init()
     assert schema_fields(result) == {
+        "controller_side": "left",
+        "flip": False,
         "red_gain": 1.0,
         "green_gain": 0.55,
         "blue_gain": 1.0,
@@ -1068,7 +1078,210 @@ def test_options_flow_texts_exist() -> None:
     root = Path(__file__).parents[1] / "custom_components" / "surplife_ble"
     strings = json.loads((root / "strings.json").read_text(encoding="utf-8"))
     init = strings["options"]["step"]["init"]
-    assert set(init["data"]) == {"red_gain", "green_gain", "blue_gain", "gamma"}
+    assert set(init["data"]) == {
+        "controller_side",
+        "flip",
+        "red_gain",
+        "green_gain",
+        "blue_gain",
+        "gamma",
+    }
+    assert init["data"]["controller_side"] == "Controller side (swap left/right)"
+    assert init["data"]["flip"] == "Upside down"
+    assert strings["selector"]["controller_side"]["options"] == {"left": "Left", "right": "Right"}
+    assert "invalid_orientation" in strings["options"]["error"]
     assert set(init["data_description"]) == set(init["data"])
     assert "invalid_calibration" in strings["options"]["error"]
     assert "not_curtain" in strings["options"]["abort"]
+
+
+# ---------------------------------------------------------------------------
+# Orientation (controller side and upside down), the default for every upload
+# ---------------------------------------------------------------------------
+
+
+def marker_png(path: Path) -> Path:
+    """A 20x20 picture with a red pixel at its top-left corner (x=0, y=0)."""
+    from PIL import Image
+
+    image = Image.new("RGB", (20, 20), (0, 0, 0))
+    image.putpixel((0, 0), (255, 0, 0))
+    image.save(path)
+    return path
+
+
+def marker_content(index: int) -> bytes:
+    """The first content payload of an upload whose only red pixel is at buffer ``index``."""
+    pixels = [(0, 0, 0)] * 400
+    pixels[index] = (255, 0, 0)
+    return curtain_c2.build_upload([pixels])[2].payload
+
+
+def uploaded_content(fake: FakeCurtain) -> list[bytes]:
+    return [payload for payload in fake.payloads if payload[:2] == b"\xea\x03"]
+
+
+ORIENTATIONS = [
+    ({}, 0),  # controller on the left, right side up: the default
+    ({"controller_side": "left", "flip": False}, 0),
+    ({"controller_side": "right"}, 380),  # column 0 becomes the far string
+    ({"flip": True}, 19),  # row 0 becomes the bottom of the string
+    ({"controller_side": "right", "flip": True}, 399),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("options", "index"), ORIENTATIONS)
+async def test_screen_play_media_follows_the_orientation_options(
+    ha: SimpleNamespace, tmp_path: Path, options: dict[str, Any], index: int
+) -> None:
+    coordinator, fake = await make_curtain(ha, options=options)
+    screen = ha.media_player.SurplifeScreen(coordinator)
+    data = marker_png(tmp_path / "marker.png").read_bytes()
+    ha.session.responses["https://example.com/marker.png"] = (200, {}, [data])
+    await screen.async_play_media("image/png", "https://example.com/marker.png")
+    assert uploaded_content(fake) == [marker_content(index)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("options", "index"), ORIENTATIONS)
+async def test_upload_service_uses_the_options_when_the_fields_are_missing(
+    ha: SimpleNamespace, tmp_path: Path, options: dict[str, Any], index: int
+) -> None:
+    hass = FakeHass(allowed=(str(tmp_path),))
+    coordinator, fake = await make_curtain(ha, hass, options=options)
+    light = ha.light.SurplifeLight(coordinator, FakeEntry())
+    path = marker_png(tmp_path / "marker.png")
+    await call_upload(light, ha, path=str(path), resample="nearest")
+    assert uploaded_content(fake) == [marker_content(index)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("options", "fields", "index"),
+    [
+        ({"controller_side": "right"}, {"controller_side": "left"}, 0),
+        ({}, {"controller_side": "right"}, 380),
+        ({"flip": True}, {"flip": False}, 0),
+        ({}, {"flip": True}, 19),
+        ({"controller_side": "right", "flip": True}, {"controller_side": "left"}, 19),
+        ({"controller_side": "right", "flip": True}, {"flip": False}, 380),
+        ({"controller_side": "right", "flip": True}, {"controller_side": "left", "flip": False}, 0),
+    ],
+)
+async def test_service_fields_override_the_options(
+    ha: SimpleNamespace,
+    tmp_path: Path,
+    options: dict[str, Any],
+    fields: dict[str, Any],
+    index: int,
+) -> None:
+    hass = FakeHass(allowed=(str(tmp_path),))
+    coordinator, fake = await make_curtain(ha, hass, options=options)
+    light = ha.light.SurplifeLight(coordinator, FakeEntry())
+    path = marker_png(tmp_path / "marker.png")
+    await call_upload(light, ha, path=str(path), resample="nearest", **fields)
+    assert uploaded_content(fake) == [marker_content(index)]
+    # The override is for this call only: the options stay as they were.
+    assert coordinator.controller_side == options.get("controller_side", "left")
+    assert coordinator.flip == options.get("flip", False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("options", "index"), ORIENTATIONS)
+async def test_preview_shows_the_picture_in_viewer_orientation(
+    ha: SimpleNamespace, tmp_path: Path, options: dict[str, Any], index: int
+) -> None:
+    hass = FakeHass(allowed=(str(tmp_path),))
+    coordinator, fake = await make_curtain(ha, hass, options=options)
+    light = ha.light.SurplifeLight(coordinator, FakeEntry())
+    await call_upload(light, ha, path=str(marker_png(tmp_path / "m.png")), resample="nearest")
+    assert uploaded_content(fake) == [marker_content(index)]  # the curtain gets it mirrored
+    preview = await ha.image.SurplifeScreenPreview(hass, coordinator).async_image()
+    assert preview is not None
+    # The preview is the source picture as the user sees it: the marker stays top-left, so
+    # the orientation is not applied a second time.
+    assert png_pixel(preview, 0, 0) == (255, 0, 0)
+    assert png_pixel(preview, 199, 0) == (0, 0, 0)
+    assert png_pixel(preview, 0, 199) == (0, 0, 0)
+    assert png_pixel(preview, 199, 199) == (0, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_orientation_options_update_live(ha: SimpleNamespace, tmp_path: Path) -> None:
+    import custom_components.surplife_ble as integration
+
+    hass = FakeHass(allowed=(str(tmp_path),))
+    coordinator, fake = await make_curtain(ha, hass)
+    light = ha.light.SurplifeLight(coordinator, FakeEntry())
+    path = str(marker_png(tmp_path / "marker.png"))
+    assert (coordinator.controller_side, coordinator.flip) == ("left", False)
+    await call_upload(light, ha, path=path, resample="nearest")
+    entry = coordinator.config_entry
+    entry.runtime_data = SimpleNamespace(coordinator=coordinator)
+    entry.options = {"controller_side": "right", "flip": True}
+    await integration._async_options_updated(hass, entry)
+    assert (coordinator.controller_side, coordinator.flip) == ("right", True)
+    await call_upload(light, ha, path=path, resample="nearest")
+    assert uploaded_content(fake) == [marker_content(0), marker_content(399)]
+
+
+@pytest.mark.asyncio
+async def test_invalid_orientation_option_falls_back_to_left(
+    ha: SimpleNamespace, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level("WARNING"):
+        coordinator, _ = await make_curtain(ha, options={"controller_side": "front"})
+    assert coordinator.controller_side == "left"
+    assert "Ignoring invalid controller side option 'front'" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_orientation_does_not_change_other_commands_or_devices(
+    ha: SimpleNamespace,
+) -> None:
+    coordinator, fake = await make_curtain(ha, options={"controller_side": "right", "flip": True})
+    light = ha.light.SurplifeLight(coordinator, FakeEntry())
+    await light.async_turn_on(rgb_color=(0, 0, 255), brightness=128)
+    assert frame_bytes(fake)[2:] == bytes.fromhex("8000000d0e0b3ba178643200000000000000ea")
+    await light.async_turn_on(effect="Effect 10", brightness=255)
+    assert fake.payloads[-1][:4] == bytes.fromhex("e002000a")
+    # A DX23012 ignores the options.
+    dx, dx_fake = await make_dx23012(ha, options={"controller_side": "right", "flip": True})
+    dx_light = ha.light.SurplifeLight(dx, FakeEntry())
+    await dx_light.async_turn_on(rgb_color=(255, 120, 0), brightness=255)
+    from custom_components.surplife_ble.core.protocol import iotbt_e1_segment_rgb
+
+    sent = next(d for _u, d, _r in reversed(dx_fake.writes) if d[8:10] == b"\xe1\x03")
+    assert sent[8:] == iotbt_e1_segment_rgb(255, 120, 0, 100)
+
+
+@pytest.mark.asyncio
+async def test_options_flow_saves_the_orientation(ha: SimpleNamespace) -> None:
+    values = {
+        "controller_side": "right",
+        "flip": True,
+        "red_gain": 1.0,
+        "green_gain": 0.8,
+        "blue_gain": 1.0,
+        "gamma": 1.0,
+    }
+    flow = option_flow(ha, FakeEntry())
+    result = await flow.async_step_init(values)
+    assert result == {"type": "create_entry", "data": values, "title": ""}
+    form = await option_flow(ha, FakeEntry(values)).async_step_init()
+    assert schema_fields(form)["controller_side"] == "right"
+    assert schema_fields(form)["flip"] is True
+    schema = form["data_schema"]
+    assert schema({"controller_side": "left", "flip": False})["controller_side"] == "left"
+    with pytest.raises(vol.Invalid):
+        schema({"controller_side": "front"})
+    with pytest.raises(vol.Invalid):
+        schema({"flip": "yes"})
+
+
+@pytest.mark.asyncio
+async def test_options_flow_rejects_an_invalid_controller_side(ha: SimpleNamespace) -> None:
+    result = await option_flow(ha, FakeEntry()).async_step_init({"controller_side": "front"})
+    assert result["type"] == "form"
+    assert result["errors"] == {"base": "invalid_orientation"}
