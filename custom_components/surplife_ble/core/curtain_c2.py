@@ -13,6 +13,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, BinaryIO, NamedTuple
 
+from .calibration import ColorCalibration
 from .framing import MAGIC_MARKER, with_checksum
 from .lz4_block import compress as lz4_compress
 
@@ -144,15 +145,24 @@ def color_hsv(hue: int, saturation: int, brightness: int = 100) -> CurtainComman
     return CurtainCommand(with_checksum(inner), CMD_COMMAND)
 
 
-def color_rgb(red: int, green: int, blue: int, brightness: int = 100) -> CurtainCommand:
+def color_rgb(
+    red: int,
+    green: int,
+    blue: int,
+    brightness: int = 100,
+    calibration: ColorCalibration | None = None,
+) -> CurtainCommand:
     """Convert RGB to hue/saturation, then send it like :func:`color_hsv`.
 
     The value component of the RGB color is ignored. ``brightness`` (0-100)
-    sets the brightness. The lamp is RGB-only: white is saturation 0.
+    sets the brightness. The lamp is RGB-only: white is saturation 0. An optional
+    ``calibration`` adjusts the RGB color first (see :mod:`.calibration`).
     """
     _check_range("red", red, 0, 255)
     _check_range("green", green, 0, 255)
     _check_range("blue", blue, 0, 255)
+    if calibration is not None:
+        red, green, blue = calibration.apply(red, green, blue)
     h, s, _v = colorsys.rgb_to_hsv(red / 255, green / 255, blue / 255)
     return color_hsv(round(h * 360) % 360, round(s * 100), brightness)
 
@@ -366,11 +376,24 @@ def solid_frame(color: RGB) -> list[RGB]:
     return [color] * PIXELS_PER_FRAME
 
 
-def frame_blob(pixels: Sequence[RGB]) -> bytes:
-    """Pack 400 buffer-order pixels into an 800-byte big-endian blob."""
+def frame_blob(pixels: Sequence[RGB], calibration: ColorCalibration | None = None) -> bytes:
+    """Pack 400 buffer-order pixels into an 800-byte big-endian blob.
+
+    An optional ``calibration`` adjusts every pixel before the coarse HSV conversion.
+    """
     if len(pixels) != PIXELS_PER_FRAME:
         raise ValueError(f"a frame needs {PIXELS_PER_FRAME} pixels, got {len(pixels)}")
-    return b"".join(pixel_hsv16(*pixel).to_bytes(2, "big") for pixel in pixels)
+    if calibration is None or calibration.is_identity:
+        return b"".join(pixel_hsv16(*pixel).to_bytes(2, "big") for pixel in pixels)
+    cache: dict[RGB, bytes] = {}
+    out = bytearray()
+    for pixel in pixels:
+        packed = cache.get(pixel)
+        if packed is None:
+            packed = pixel_hsv16(*calibration.apply(*pixel)).to_bytes(2, "big")
+            cache[pixel] = packed
+        out += packed
+    return bytes(out)
 
 
 def lz4_block(blob: bytes) -> bytes:
@@ -425,12 +448,14 @@ def upload_address(block_lengths: Sequence[int]) -> bytes:
     return bytes(address)
 
 
-def build_upload(frames: Sequence[Sequence[RGB]]) -> list[UploadStep]:
+def build_upload(
+    frames: Sequence[Sequence[RGB]], calibration: ColorCalibration | None = None
+) -> list[UploadStep]:
     """Build the header, address, content and end payloads for an upload.
 
     Every frame is a list of 400 buffer-order pixels and is compressed separately.
     All payloads are sent with cmdId 0x0A. At most ``MAX_UPLOAD_FRAMES`` (128) frames
-    fit in the device.
+    fit in the device. An optional ``calibration`` adjusts the pixel colors first.
 
     Every step is acked, so the sender waits for the device reply before it sends the next
     step. This is the flow control of the upload: without it a weak Bluetooth link loses
@@ -447,7 +472,7 @@ def build_upload(frames: Sequence[Sequence[RGB]]) -> list[UploadStep]:
             f"an upload needs 1 to {MAX_UPLOAD_FRAMES} frames "
             f"({MAX_UPLOAD_BYTES} bytes at 20x20), got {len(frames)}"
         )
-    blocks = [lz4_block(frame_blob(frame)) for frame in frames]
+    blocks = [lz4_block(frame_blob(frame, calibration)) for frame in frames]
     steps = [
         UploadStep("header", upload_header(len(blocks)), True),
         UploadStep("address", upload_address([len(block) for block in blocks]), True),

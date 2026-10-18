@@ -88,5 +88,31 @@
         }
       }
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Color calibration",
+        "description": "Adjust how colors look on an IOTBT curtain. The curtain stores colors in a coarse HSV format and its LEDs differ from a screen. Use `ble-rgb curtain calibrate` to find good values. 1.0 changes nothing.",
+        "data": {
+          "red_gain": "Red gain",
+          "green_gain": "Green gain",
+          "blue_gain": "Blue gain",
+          "gamma": "Gamma"
+        },
+        "data_description": {
+          "red_gain": "Multiplier for the red channel, from 0.0 to 2.0.",
+          "green_gain": "Multiplier for the green channel, from 0.0 to 2.0. LED green is strong, so values below 1.0 often look better.",
+          "blue_gain": "Multiplier for the blue channel, from 0.0 to 2.0.",
+          "gamma": "Applied to every channel before the gains, from 0.2 to 4.0. Values above 1.0 darken dark tones."
+        }
+      }
+    },
+    "error": {
+      "invalid_calibration": "The values are outside the allowed range."
+    },
+    "abort": {
+      "not_curtain": "Color calibration is only available for IOTBT curtain lights."
+    }
   }
 }

@@ -136,6 +136,16 @@ the right. `controller_side` says which side of the picture it is on, so the pic
 upright. With `left`, image column 0 is the string nearest the controller. With `right`, the
 columns are reversed. `flip` swaps top and bottom.
 
+**Color calibration.** The curtain stores colors in a coarse format and its LEDs differ from
+a screen: green is strong, and partly saturated colors look pale. Choose **Configure** on the
+curtain to set a gain for red, green and blue (0.0 to 2.0) and a gamma (0.2 to 4.0). The
+default of 1.0 changes nothing. The calibration applies to the light's colors and to every
+image the service or the Screen uploads, and takes effect at once. It does not apply to
+effects or the stored animation. Find good values with `ble-rgb curtain calibrate` (see
+Development). Tips: use fully saturated colors with one channel at 0 (a good LED orange is
+`#FF3C00`, not `#FF7518`), lower the green gain if green is too strong, and raise the gamma to
+darken dark tones.
+
 **Limits and flash wear.**
 
 - Every upload writes the curtain's flash memory. The animation then survives power cycles and
@@ -260,6 +270,22 @@ The curtain has no front or back, so the controller box can hang on the left or 
 `--controller-side left|right` (default `left`) says which side of the image it is on.
 With `left`, image column 0 is the string nearest the controller. With `right`, the columns
 are reversed. `--mirror` flips the choice.
+
+**Color calibration from the command line.** `curtain calibrate` is an interactive session
+that shows reference colors on the whole curtain, with the color command only (nothing is
+written to flash). Adjust per-channel gains and the gamma, then save them to a JSON file:
+
+```bash
+ble-rgb curtain calibrate --device MAC --allow-curtain-c2 --save led.json
+ble-rgb curtain color --device MAC --allow-curtain-c2 --rgb 255,60,0 --calibration led.json
+ble-rgb curtain upload --device MAC --image anim.gif --allow-curtain-c2 --allow-flash-write \
+  --calibration led.json
+```
+
+In the session type `next`, `prev`, `color R,G,B`, `r+ r- g+ g- b+ b-`, `gamma+ gamma-`,
+`set red_gain 0.8`, `show`, `save [FILE]` or `quit`. Use the same values in the Home Assistant
+options. See [docs/IOTBT_CURTAIN_0xC2_FINDINGS.md](docs/IOTBT_CURTAIN_0xC2_FINDINGS.md),
+section 13.
 
 For an unknown protocol, the safest method is state-diffing.
 Set the lamp to known states with the vendor app.

@@ -228,13 +228,18 @@ ble-rgb curtain upload --device MAC --allow-curtain-c2 --allow-flash-write \
   --image anim.gif --speed 50
 ble-rgb curtain upload --device MAC --allow-curtain-c2 --allow-flash-write \
   --solid "255,0,0;0,0,255" --speed 50
+ble-rgb curtain calibrate --device MAC --allow-curtain-c2 --save led.json
+ble-rgb curtain color  --device MAC --allow-curtain-c2 --rgb 255,60,0 --calibration led.json
+ble-rgb curtain upload --device MAC --allow-curtain-c2 --allow-flash-write \
+  --image anim.gif --calibration led.json
 ```
 
 `upload` writes the animation to device flash, so it also needs `--allow-flash-write`. See
-section 10 for its options.
+section 10 for its options. `calibrate` and `--calibration` are described in section 13.
 
 The builders are in `core/curtain_c2.py`: `power`, `color_hsv`, `color_rgb`, `effect`,
-`state_query`, `play`, `build_upload`, `parse_upload_reply` and `parse_state`.
+`state_query`, `play`, `build_upload`, `parse_upload_reply` and `parse_state`. The color
+calibration is in `core/calibration.py`.
 
 ## 10. Images and animations
 
@@ -476,7 +481,95 @@ A curtain is one device with four entities:
 Services `surplife_ble.upload_animation` and `surplife_ble.play_animation` use the same
 upload pipeline as the Screen. See the README. Each upload writes the device flash.
 
-## 13. Open items
+The options of the config entry hold the color calibration (section 13): `red_gain`,
+`green_gain`, `blue_gain` and `gamma`. It applies to the light's colors and to every image
+upload, from the service and from the Screen. It does not apply to effects, playback or other
+devices. A change in the options takes effect at once, without a reload.
+
+## 13. Color calibration and LED color tips
+
+The curtain stores a pixel as coarse HSV: hue in 3 degree steps (0-120), saturation 0-15 and
+value 0-31. The LEDs also render colors differently from a screen. On hardware (observed by
+eye, not measured):
+
+- LED green is strong. A screen's `#00FF00` looks much brighter than the same value in red or
+  blue.
+- Partly saturated colors look pale. `#FF7518` (a screen orange) looked pale white.
+- A good LED orange is `#FF3C00` (hue about 14 degrees, full saturation).
+- A good brownish olive green is `#5A7800` (hue about 75 degrees, full saturation, darker).
+
+Tips:
+
+- Use fully saturated colors, with one RGB channel at 0 where you can. Mixed, pastel and
+  desaturated colors turn pale or white, because the saturation has only 16 steps and the
+  LEDs wash out.
+- For orange use hue 10 to 20 degrees (`#FF3C00`), not 25 to 30 degrees (`#FF7518`).
+- Make dark colors with a low value, not by lowering saturation. Olive is `#5A7800`.
+- If green looks too strong, lower the green gain (for example 0.7).
+- Raise gamma above 1.0 to darken dark and mid tones. Lower it to lift them.
+- A warm white is `#FFB46E`. Saturation 0 is a white-ish mix of all three LEDs.
+
+### 13.1 The calibration
+
+The calibration is deliberately minimal: a gain per RGB channel and one gamma value. It is
+applied to the RGB color before the HSV conversion, for each channel `c`:
+
+```text
+c' = clamp(round(255 * min(1, (c / 255) ** gamma * gain)))
+```
+
+- Gains are 0.0 to 2.0 and gamma is 0.2 to 4.0. The default is 1.0 for all four, which
+  changes nothing: the input comes back byte for byte.
+- It is stored as JSON: `{"red_gain": 1.0, "green_gain": 0.7, "blue_gain": 1.0, "gamma": 1.2}`.
+  Missing fields keep the default. Unknown fields and out-of-range values are errors.
+- It applies to the whole-curtain color command (`color_rgb`, `LightClient.set_rgb` and
+  `set_brightness`) and to image and GIF uploads (`build_upload`, before each pixel is
+  quantized). It does not apply to `--hsv` colors, effects, playback or the DX23012.
+- The whole-curtain color command ignores the value of an RGB color (the brightness is a
+  separate field), so gains and gamma change its hue and saturation. In uploads they also
+  change the value of each pixel.
+- Rounding of exact halves goes to the even number (Python `round`), so 127.5 becomes 128.
+
+### 13.2 `ble-rgb curtain calibrate`
+
+An interactive session that shows reference swatches on the whole curtain. It uses the color
+command (`3B A1`, cmdId `0x0B`) only. It never writes to flash and never touches `FE00` or
+`FF11`. Turn the curtain on first.
+
+```bash
+ble-rgb curtain calibrate --device MAC --allow-curtain-c2 \
+  [--calibration start.json] [--save led.json]
+```
+
+The swatches are white, red, orange (`#FF3C00`), yellow (`#FFB400`), green, olive
+(`#5A7800`), cyan, blue, purple and warm white (`#FFB46E`). The brightness of a swatch is the
+value of its calibrated color, so dark colors look dark, as they would in an upload.
+
+| Command | Effect |
+| --- | --- |
+| `next`, `prev` | Show the next or previous swatch |
+| `color R,G,B` | Show any color |
+| `r+ r- g+ g- b+ b-` | Change a gain by 0.05 |
+| `gamma+ gamma-` | Change the gamma by 0.1 |
+| `set NAME VALUE` | Set `red_gain`, `green_gain`, `blue_gain` or `gamma` |
+| `show`, `list` | Print the calibration and swatch, or the swatch list |
+| `save [FILE]` | Write the JSON file (default: the `--save` file) |
+| `help`, `quit` | |
+
+After every change the swatch is sent again. Each line shows the raw and the calibrated RGB,
+the hue and saturation of the color command, its packed 16-bit value (`hs16`, hue shifted left
+by 7 plus saturation) and the 16-bit HSV pixel (`pixel16`) that an upload would store. A value
+that is out of range is refused and the calibration stays as it was. When the session ends
+with unsaved changes it prints a warning.
+
+### 13.3 Home Assistant
+
+A curtain entry has an options flow (Configure) with the four values as sliders: gains 0.0 to
+2.0 and gamma 0.2 to 4.0 in steps of 0.05. The flow is refused for devices that are known not
+to be curtains. Use `ble-rgb curtain calibrate` to find good values first. The preview image
+shows the picture as given, before the calibration.
+
+## 14. Open items
 
 - Effect IDs other than 1 and 10 are untested. Scenes in general are untested.
 - The meaning of byte 7 (`0x62` before color, `0x66` after color, `0x67` scene, `0x74`
@@ -490,3 +583,5 @@ upload pipeline as the Screen. See the README. Each upload writes the device fla
 - Uploads overwrite flash. Whether there is more than one slot is unknown.
 - Byte 5 as a led/firmware version is a hypothesis.
 - Color and brightness are never reported, so Home Assistant shows them as assumed state.
+- The calibration values for the LED look were chosen by eye. The calibration is not a
+  measured color profile, and it has no per-device default.

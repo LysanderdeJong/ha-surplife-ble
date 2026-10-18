@@ -6,6 +6,7 @@ import pytest
 from curtain_fakes import FF01, FakeCurtain, _Device
 
 from custom_components.surplife_ble.core import curtain_c2
+from custom_components.surplife_ble.core.calibration import ColorCalibration
 from custom_components.surplife_ble.core.client import LightClient
 from custom_components.surplife_ble.core.models import ProtocolResolution
 
@@ -239,12 +240,59 @@ async def test_curtain_codec_routes_control_through_curtain_c2(
     for name in ("power", "color_rgb"):
         original = getattr(curtain_c2, name)
 
-        def spy(*args: object, _name: str = name, _original: object = original) -> object:
+        def spy(
+            *args: object, _name: str = name, _original: object = original, **kwargs: object
+        ) -> object:
             calls.append(_name)
-            return _original(*args)  # type: ignore[operator]
+            return _original(*args, **kwargs)  # type: ignore[operator]
 
         monkeypatch.setattr(curtain_c2, name, spy)
     await client.set_power(True)
     await client.set_rgb(1, 2, 3, brightness=40)
     await client.set_brightness(20)
     assert calls == ["power", "color_rgb", "color_rgb"]
+
+
+@pytest.mark.asyncio
+async def test_calibration_applies_to_color_and_brightness_commands() -> None:
+    fake = FakeCurtain()
+    client = await resolved(fake)
+    client.curtain_calibration = ColorCalibration(green_gain=0.5)
+    await client.set_rgb(0, 255, 255, brightness=100)
+    # (0, 255, 255) becomes (0, 128, 255): hue 210 instead of 180.
+    assert last_frame(fake)[2:] == bytes.fromhex("8000000d0e0b3ba1696464000000000000000d")
+    # The assumed state keeps the color Home Assistant asked for.
+    assert client.curtain_rgb == (0, 255, 255)
+    assert client.state is not None and client.state.rgb == (0, 255, 255)
+    await client.set_brightness(50)
+    assert fake.payloads[-1] == curtain_c2.color_rgb(
+        0, 255, 255, 50, calibration=client.curtain_calibration
+    ).payload
+    assert fake.payloads[-1].hex().startswith("3ba169643200")
+
+
+@pytest.mark.asyncio
+async def test_default_calibration_is_the_identity() -> None:
+    fake = FakeCurtain()
+    client = await resolved(fake)
+    assert client.curtain_calibration.is_identity
+    await client.set_rgb(0, 255, 255, brightness=100)
+    assert last_frame(fake)[2:] == bytes.fromhex("8000000d0e0b3ba15a646400000000000000fe")
+
+
+@pytest.mark.asyncio
+async def test_calibration_applies_to_uploads_but_not_to_effects_or_playback() -> None:
+    fake = FakeCurtain()
+    client = await resolved(fake)
+    calibration = ColorCalibration(gamma=2.0)
+    client.curtain_calibration = calibration
+    frames = [[(255, 120, 0)] * 400]
+    await client.upload_curtain_animation(frames, mode=1, speed=50, brightness=100)
+    expected = curtain_c2.build_upload(frames, calibration)
+    uploaded = [payload for payload in fake.payloads if payload[:2] == b"\xea\x03"]
+    assert uploaded == [expected[2].payload]
+    assert uploaded[0] != curtain_c2.build_upload(frames)[2].payload
+    await client.set_effect(10, 80, 100)
+    assert fake.payloads[-1] == bytes.fromhex("e002000a5064")
+    await client.play_animation(1, 50, 100)
+    assert fake.payloads[-1] == bytes.fromhex("e20901326400")

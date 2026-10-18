@@ -8,11 +8,30 @@ import voluptuous as vol
 from bleak import BleakError
 from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth import BluetoothServiceInfo, BluetoothServiceInfoBleak
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlow,
+)
 from homeassistant.const import CONF_ADDRESS, CONF_NAME
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.selector import (
+    NumberSelector,
+    NumberSelectorConfig,
+    NumberSelectorMode,
+)
 
-from .const import DOMAIN
+from .const import (
+    CALIBRATION_OPTIONS,
+    CONF_BLUE_GAIN,
+    CONF_GAMMA,
+    CONF_GREEN_GAIN,
+    CONF_RED_GAIN,
+    DOMAIN,
+)
+from .core import calibration as color_calibration
+from .core.calibration import CalibrationError, ColorCalibration
 
 # Service data UUID prefix advertised by IOTBT/Surplife BLE lights.
 # Devices may use 00005a00, 00005a02, etc. — match by prefix.
@@ -69,6 +88,12 @@ class SurplifeBleConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle discovery and manual setup for Surplife BLE lights."""
 
     VERSION = 1
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry: ConfigEntry) -> SurplifeOptionsFlow:
+        """Return the options flow (color calibration for the IOTBT curtain)."""
+        return SurplifeOptionsFlow(config_entry)
 
     def __init__(self) -> None:
         """Initialize the config flow."""
@@ -188,4 +213,78 @@ class SurplifeBleConfigFlow(ConfigFlow, domain=DOMAIN):
             ),
             errors=errors,
             description_placeholders={},
+        )
+
+
+def _gain_selector() -> NumberSelector:
+    return NumberSelector(
+        NumberSelectorConfig(
+            min=color_calibration.GAIN_MIN,
+            max=color_calibration.GAIN_MAX,
+            step=0.05,
+            mode=NumberSelectorMode.SLIDER,
+        )
+    )
+
+
+def _gamma_selector() -> NumberSelector:
+    return NumberSelector(
+        NumberSelectorConfig(
+            min=color_calibration.GAMMA_MIN,
+            max=color_calibration.GAMMA_MAX,
+            step=0.05,
+            mode=NumberSelectorMode.SLIDER,
+        )
+    )
+
+
+class SurplifeOptionsFlow(OptionsFlow):
+    """Color calibration for the IOTBT curtain: a gain per channel and a gamma."""
+
+    def __init__(self, config_entry: ConfigEntry) -> None:
+        """Keep the entry. Newer Home Assistant versions also provide config_entry."""
+        self._entry = config_entry
+
+    def _is_other_device(self) -> bool:
+        """True when the device is known and is not an IOTBT curtain."""
+        runtime_data = getattr(self._entry, "runtime_data", None)
+        client = getattr(getattr(runtime_data, "coordinator", None), "client", None)
+        resolution = getattr(client, "resolution", None)
+        return resolution is not None and not client.is_curtain
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Show or save the calibration."""
+        if self._is_other_device():
+            return self.async_abort(reason="not_curtain")
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            try:
+                ColorCalibration.from_dict(
+                    {key: user_input[key] for key in CALIBRATION_OPTIONS if key in user_input}
+                )
+            except CalibrationError:
+                errors["base"] = "invalid_calibration"
+            else:
+                return self.async_create_entry(data=dict(user_input))
+        current = ColorCalibration.from_dict(
+            {k: v for k, v in dict(self._entry.options).items() if k in CALIBRATION_OPTIONS}
+        )
+        defaults = user_input or current.to_dict()
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_RED_GAIN, default=defaults[CONF_RED_GAIN]): _gain_selector(),
+                    vol.Required(
+                        CONF_GREEN_GAIN, default=defaults[CONF_GREEN_GAIN]
+                    ): _gain_selector(),
+                    vol.Required(
+                        CONF_BLUE_GAIN, default=defaults[CONF_BLUE_GAIN]
+                    ): _gain_selector(),
+                    vol.Required(CONF_GAMMA, default=defaults[CONF_GAMMA]): _gamma_selector(),
+                }
+            ),
+            errors=errors,
         )

@@ -13,6 +13,7 @@ from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
 
 from . import curtain_c2
+from .calibration import IDENTITY, ColorCalibration
 from .capture import JsonlCapture
 from .framing import NotificationReassembler, SequenceCounter, wrap_magichome_segments
 from .models import (
@@ -96,6 +97,8 @@ class LightClient:
         # color sent is remembered here as assumed state.
         self._curtain_rgb: tuple[int, int, int] | None = None
         self._curtain_percent: int | None = None
+        # Color calibration for curtain colors and uploads (identity: no change).
+        self.curtain_calibration: ColorCalibration = IDENTITY
 
     @property
     def connected(self) -> bool:
@@ -783,7 +786,9 @@ class LightClient:
             await asyncio.sleep(0.15)
 
     async def _set_curtain_rgb(self, red: int, green: int, blue: int, brightness: int) -> None:
-        command = curtain_c2.color_rgb(red, green, blue, brightness)
+        command = curtain_c2.color_rgb(
+            red, green, blue, brightness, calibration=self.curtain_calibration
+        )
         await self._curtain_ensure_on()
         await self._send_curtain(command, "curtain color")
         self._curtain_rgb = (red, green, blue)
@@ -893,8 +898,11 @@ class LightClient:
         ack_timeout: float = 4.0,
         progress: Callable[[str], None] | None = None,
     ) -> None:
-        """Upload buffer-order 20 x 20 frames (at most 128) to the device flash."""
-        steps = curtain_c2.build_upload(frames)
+        """Upload buffer-order 20 x 20 frames (at most 128) to the device flash.
+
+        The color calibration of this client is applied to every pixel.
+        """
+        steps = curtain_c2.build_upload(frames, self.curtain_calibration)
         await self.upload_steps(steps, ack_timeout=ack_timeout, progress=progress)
 
     async def upload_curtain_animation(

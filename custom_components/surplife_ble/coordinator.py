@@ -19,8 +19,9 @@ from homeassistant.const import CONF_ADDRESS
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .const import UPDATE_INTERVAL
+from .const import CALIBRATION_OPTIONS, UPDATE_INTERVAL
 from .core import curtain_c2
+from .core.calibration import IDENTITY, CalibrationError, ColorCalibration
 from .core.client import LightClient
 from .core.models import LightState, apply_assumed_rgb, rgb_state_matches
 
@@ -59,11 +60,35 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
         self._assumed_rgb_brightness: int | None = None
         self._assumed_rgb_deadline: float | None = None
         self._confirmation_generation = 0
+        self._calibration = self._load_calibration()
         # IOTBT curtain only: kept in memory for the Screen entities.
         self.animation_title: str | None = None
         self.preview_png: bytes | None = None
         self.preview_updated: datetime | None = None
         self._last_animation_speed: int = 50
+
+    @property
+    def calibration(self) -> ColorCalibration:
+        """The curtain color calibration from the entry options (identity if unset)."""
+        return self._calibration
+
+    def _load_calibration(self) -> ColorCalibration:
+        options = {
+            key: value
+            for key, value in dict(self.config_entry.options).items()
+            if key in CALIBRATION_OPTIONS
+        }
+        try:
+            return ColorCalibration.from_dict(options)
+        except CalibrationError as err:
+            _LOGGER.warning("Ignoring invalid color calibration options: %s", err)
+            return IDENTITY
+
+    def async_update_calibration(self) -> None:
+        """Apply changed options to the connected client without reconnecting."""
+        self._calibration = self._load_calibration()
+        if self.client is not None:
+            self.client.curtain_calibration = self._calibration
 
     def async_set_ble_device(
         self, device: BLEDevice, advertisement: AdvertisementData | None
@@ -111,6 +136,7 @@ class SurplifeCoordinator(DataUpdateCoordinator[LightState]):
             )
         else:
             self.client.set_ble_device(self._ble_device, self._advertisement)
+        self.client.curtain_calibration = self.calibration
         await self.client.connect()
         return self.client
 

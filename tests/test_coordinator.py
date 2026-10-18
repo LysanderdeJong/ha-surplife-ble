@@ -90,6 +90,7 @@ class FakeHass:
 class FakeEntry:
     title = "Test light"
     data = {"address": "DEVICE"}
+    options: dict[str, object] = {}
 
 
 def test_current_ble_device_uses_home_assistant_best_route(

@@ -9,6 +9,11 @@ import sys
 from collections.abc import Awaitable, Callable
 
 from custom_components.surplife_ble.core import curtain_c2
+from custom_components.surplife_ble.core.calibration import (
+    IDENTITY,
+    CalibrationError,
+    ColorCalibration,
+)
 from custom_components.surplife_ble.core.capture import JsonlCapture, load_replay, write_json
 from custom_components.surplife_ble.core.client import LightClient
 from custom_components.surplife_ble.core.framing import wrap_magichome_segments
@@ -31,6 +36,8 @@ from custom_components.surplife_ble.core.statediff import (
     format_recommendations,
     generate_recommendations,
 )
+
+from .curtain_calibrate import CalibrationSession
 
 CURTAIN_RESPONSE_TIMEOUT = 1.5
 UPLOAD_ACK_TIMEOUT = 4.0
@@ -268,6 +275,13 @@ def _solid_colors(value: str) -> list[tuple[int, int, int]]:
     return [_rgb(item) for item in value.split(";") if item.strip()]
 
 
+def _calibration_file(value: str) -> ColorCalibration:
+    try:
+        return ColorCalibration.load(value)
+    except CalibrationError as err:
+        raise argparse.ArgumentTypeError(str(err)) from err
+
+
 def _byte(value: str) -> int:
     parsed = int(value, 0)
     if not 0 <= parsed <= 255:
@@ -336,6 +350,11 @@ def _add_curtain_parsers(subparsers: argparse._SubParsersAction) -> None:  # typ
     group.add_argument("--rgb", type=_rgb, help="R,G,B with channels 0-255")
     group.add_argument("--hsv", type=_hsv, help="H,S with hue 0-359 and saturation 0-100")
     color.add_argument("--brightness", type=_percentage, default=100, help="0-100 (default 100)")
+    color.add_argument(
+        "--calibration",
+        type=_calibration_file,
+        help="JSON color calibration (red_gain, green_gain, blue_gain, gamma); --rgb only",
+    )
 
     effect = sub.add_parser("effect", help="start a built-in effect (E0 02)")
     _add_curtain_options(effect)
@@ -421,7 +440,36 @@ def _add_curtain_parsers(subparsers: argparse._SubParsersAction) -> None:  # typ
         default=UPLOAD_ACK_TIMEOUT,
         help="seconds to wait for each acked step before aborting (default 4)",
     )
+    upload.add_argument(
+        "--calibration",
+        type=_calibration_file,
+        help="JSON color calibration applied to every pixel before the HSV conversion",
+    )
     _add_play_options(upload)
+
+    calibrate = sub.add_parser(
+        "calibrate",
+        help="interactive color calibration with reference swatches (no flash writes)",
+        description=(
+            "Show reference colors on the whole curtain with the color command (nothing is "
+            "written to flash) and adjust per-channel gains and a gamma until they look "
+            "right. After every change the swatch is sent again. Each line shows the raw "
+            "and calibrated RGB, the hue and saturation of the color command, its packed "
+            "16-bit value (hs16) and the 16-bit HSV pixel (pixel16) an upload would store. "
+            "Commands: next, prev, color R,G,B, r+ r- g+ g- b+ b-, gamma+ gamma-, "
+            "set NAME VALUE, show, list, save [FILE], help, quit."
+        ),
+    )
+    _add_curtain_options(calibrate)
+    calibrate.add_argument(
+        "--calibration",
+        type=_calibration_file,
+        help="start from this JSON calibration (default: no change)",
+    )
+    calibrate.add_argument(
+        "--save",
+        help="JSON file that `save` writes to when no file name is given",
+    )
 
 
 async def _device_client(args: argparse.Namespace) -> LightClient:
@@ -511,8 +559,10 @@ def _curtain_command(args: argparse.Namespace) -> curtain_c2.CurtainCommand | No
         return curtain_c2.power(False)
     if name == "color":
         if args.hsv is not None:
+            if args.calibration is not None:
+                raise ValueError("--calibration can only be used with --rgb, not --hsv")
             return curtain_c2.color_hsv(*args.hsv, args.brightness)
-        return curtain_c2.color_rgb(*args.rgb, args.brightness)
+        return curtain_c2.color_rgb(*args.rgb, args.brightness, calibration=args.calibration)
     if name == "effect":
         return curtain_c2.effect(args.effect_id, args.speed, args.brightness)
     if name == "play":
@@ -582,6 +632,8 @@ async def _curtain(args: argparse.Namespace) -> int:
     """Run one verified curtain command and print the decoded EA 81 state."""
     if args.curtain_command == "upload":
         return await _curtain_upload(args)
+    if args.curtain_command == "calibrate":
+        return await _curtain_calibrate(args)
     command = _curtain_command(args)
     client = await _device_client(args)
     async with client:
@@ -620,10 +672,35 @@ def _upload_frames(
     return loaded.frames, args.image
 
 
+async def _ask_stdin(prompt: str) -> str:
+    return await asyncio.to_thread(input, prompt)
+
+
+async def _curtain_calibrate(
+    args: argparse.Namespace,
+    *,
+    ask: Callable[[str], Awaitable[str]] = _ask_stdin,
+    out: Callable[[str], None] = print,
+) -> int:
+    """Interactive color calibration. Sends color commands only; never writes flash."""
+    client = await _device_client(args)
+    async with client:
+        await _curtain_prepare(client)
+
+        async def send(command: curtain_c2.CurtainCommand) -> None:
+            await _curtain_send(client, command, "curtain calibrate")
+
+        session = CalibrationSession(
+            send, args.calibration or IDENTITY, save_path=args.save, out=out
+        )
+        await session.run(ask)
+    return 0
+
+
 async def _curtain_upload(args: argparse.Namespace) -> int:
     """Upload frames to device flash, then optionally play them."""
     frames, source = _upload_frames(args)
-    steps = curtain_c2.build_upload(frames)
+    steps = curtain_c2.build_upload(frames, calibration=args.calibration)
     print(f"Uploading {len(frames)} frame(s) from {source} to device flash")
     client = await _device_client(args)
     async with client:

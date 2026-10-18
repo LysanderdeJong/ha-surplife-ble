@@ -15,6 +15,7 @@ from fake_homeassistant import FakeEntry, FakeHass, HomeAssistantError, install,
 from test_client import FakeIotbtBleakClient
 
 from custom_components.surplife_ble.core import curtain_c2
+from custom_components.surplife_ble.core.calibration import ColorCalibration
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
@@ -25,10 +26,13 @@ def ha(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
 
 
 async def make_curtain(
-    ha: SimpleNamespace, hass: FakeHass | None = None, fake: FakeCurtain | None = None
+    ha: SimpleNamespace,
+    hass: FakeHass | None = None,
+    fake: FakeCurtain | None = None,
+    options: dict[str, Any] | None = None,
 ) -> tuple[Any, FakeCurtain]:
     fake = fake or FakeCurtain()
-    coordinator = make_coordinator(ha, fake, hass)
+    coordinator = make_coordinator(ha, fake, hass, options)
     await coordinator.client.connect()
     await coordinator.client.probe(allow_writes=True, response_timeout=0.05)  # fast resolve
     coordinator.data = await coordinator._async_update_data()
@@ -38,9 +42,11 @@ async def make_curtain(
     return coordinator, fake
 
 
-async def make_dx23012(ha: SimpleNamespace) -> tuple[Any, FakeIotbtBleakClient]:
+async def make_dx23012(
+    ha: SimpleNamespace, options: dict[str, Any] | None = None
+) -> tuple[Any, FakeIotbtBleakClient]:
     fake = FakeIotbtBleakClient()
-    coordinator = make_coordinator(ha, fake)
+    coordinator = make_coordinator(ha, fake, None, options)
     await coordinator.client.connect()
     await coordinator.client.probe(allow_writes=True, response_timeout=0.05)  # fast resolve
     coordinator.data = await coordinator._async_update_data()
@@ -842,3 +848,227 @@ async def test_dx23012_coordinator_state_is_not_touched(ha: SimpleNamespace) -> 
     assert state.mode is None and state.effect is None and state.speed is None
     assert state.rgb is not None
     assert not coordinator.is_curtain
+
+
+# ---------------------------------------------------------------------------
+# Color calibration (config entry options)
+# ---------------------------------------------------------------------------
+
+GREEN_HALF = {"red_gain": 1.0, "green_gain": 0.5, "blue_gain": 1.0, "gamma": 1.0}
+GAMMA_2 = {"gamma": 2.0}
+
+
+@pytest.mark.asyncio
+async def test_calibration_comes_from_the_entry_options(
+    ha: SimpleNamespace, caplog: pytest.LogCaptureFixture
+) -> None:
+    coordinator, _ = await make_curtain(ha)
+    assert coordinator.calibration.is_identity
+    assert coordinator.client.curtain_calibration.is_identity
+    coordinator.config_entry.options = {**GREEN_HALF, "unrelated": "kept out"}
+    coordinator.async_update_calibration()
+    assert coordinator.calibration == ColorCalibration(green_gain=0.5)
+    assert coordinator.client.curtain_calibration == ColorCalibration(green_gain=0.5)
+    # Invalid stored values are ignored with a warning, not applied.
+    coordinator.config_entry.options = {"gamma": 9.0}
+    with caplog.at_level("WARNING"):
+        coordinator.async_update_calibration()
+    assert coordinator.calibration.is_identity
+    assert "Ignoring invalid color calibration options" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_new_clients_start_with_the_configured_calibration(ha: SimpleNamespace) -> None:
+    coordinator, _ = await make_curtain(ha, options=GREEN_HALF)
+    assert coordinator.client.curtain_calibration == ColorCalibration(green_gain=0.5)
+
+
+@pytest.mark.asyncio
+async def test_light_colors_use_the_calibration(ha: SimpleNamespace) -> None:
+    coordinator, fake = await make_curtain(ha, options=GREEN_HALF)
+    light = ha.light.SurplifeLight(coordinator, FakeEntry())
+    await light.async_turn_on(rgb_color=(0, 255, 255), brightness=255)
+    # (0, 255, 255) is calibrated to (0, 128, 255): hue 210 instead of 180.
+    assert frame_bytes(fake)[2:] == bytes.fromhex("8000000d0e0b3ba1696464000000000000000d")
+    await light.async_turn_on(brightness=128)  # resends the same color at 50 %
+    assert fake.payloads[-1].hex().startswith("3ba169643200")
+    # Home Assistant still shows the color it asked for.
+    state = await coordinator._async_update_data()
+    assert state.rgb == (0, 255, 255)
+    # Effects and the stored animation carry no color and are not calibrated.
+    await light.async_turn_on(effect="Effect 10", brightness=255)
+    assert fake.payloads[-1][:4] == bytes.fromhex("e002000a")
+    assert fake.payloads[-1][5] == 100  # the effect command has no color to calibrate
+
+
+@pytest.mark.asyncio
+async def test_options_listener_updates_the_calibration_live(ha: SimpleNamespace) -> None:
+    import custom_components.surplife_ble as integration
+
+    coordinator, fake = await make_curtain(ha)
+    light = ha.light.SurplifeLight(coordinator, FakeEntry())
+    await light.async_turn_on(rgb_color=(0, 255, 255), brightness=255)
+    assert fake.payloads[-1].hex().startswith("3ba15a64")  # hue 180, uncalibrated
+    entry = coordinator.config_entry
+    entry.runtime_data = SimpleNamespace(coordinator=coordinator)
+    entry.options = dict(GREEN_HALF)
+    await integration._async_options_updated(FakeHass(), entry)
+    await light.async_turn_on(rgb_color=(0, 255, 255), brightness=255)
+    assert fake.payloads[-1].hex().startswith("3ba16964")  # hue 210
+    entry.options = {}
+    await integration._async_options_updated(FakeHass(), entry)
+    await light.async_turn_on(rgb_color=(0, 255, 255), brightness=255)
+    assert fake.payloads[-1].hex().startswith("3ba15a64")
+
+
+def solid_png(path: Path, color: tuple[int, int, int]) -> Path:
+    from PIL import Image
+
+    Image.new("RGB", (20, 20), color).save(path)
+    return path
+
+
+@pytest.mark.asyncio
+async def test_upload_animation_service_applies_the_calibration(
+    ha: SimpleNamespace, tmp_path: Path
+) -> None:
+    hass = FakeHass(allowed=(str(tmp_path),))
+    coordinator, fake = await make_curtain(ha, hass, options=GAMMA_2)
+    light = ha.light.SurplifeLight(coordinator, FakeEntry())
+    path = solid_png(tmp_path / "orange.png", (255, 120, 0))
+    await call_upload(light, ha, path=str(path), resample="nearest")
+    calibrated = [p for p in fake.payloads if p[:2] == b"\xea\x03"]
+    # gamma 2 turns (255, 120, 0) into (255, 56, 0): pixel 0x09ff instead of 0x13ff.
+    block = curtain_c2.lz4_block(bytes.fromhex("09ff") * 400)
+    assert calibrated == [bytes.fromhex("ea030001") + block]
+    assert calibrated == [
+        curtain_c2.build_upload([[(255, 120, 0)] * 400], ColorCalibration(gamma=2.0))[2].payload
+    ]
+    # The preview shows the picture, not the calibrated pixels.
+    assert png_pixel(coordinator.preview_png, 100, 100) == (255, 120, 0)
+
+
+@pytest.mark.asyncio
+async def test_screen_play_media_applies_the_calibration(
+    ha: SimpleNamespace, tmp_path: Path
+) -> None:
+    coordinator, fake = await make_curtain(ha, options=GAMMA_2)
+    screen = ha.media_player.SurplifeScreen(coordinator)
+    data = solid_png(tmp_path / "o.png", (255, 120, 0)).read_bytes()
+    ha.session.responses["https://example.com/o.png"] = (200, {}, [data])
+    await screen.async_play_media("image/png", "https://example.com/o.png")
+    content = [p for p in fake.payloads if p[:2] == b"\xea\x03"]
+    block = curtain_c2.lz4_block(bytes.fromhex("09ff") * 400)
+    assert content == [bytes.fromhex("ea030001") + block]
+
+
+@pytest.mark.asyncio
+async def test_calibration_does_not_touch_the_dx23012(ha: SimpleNamespace) -> None:
+    extreme = {"red_gain": 0.3, "green_gain": 0.1, "blue_gain": 2.0, "gamma": 3.0}
+    coordinator, fake = await make_dx23012(ha, options=extreme)
+    light = ha.light.SurplifeLight(coordinator, FakeEntry())
+    await light.async_turn_on(rgb_color=(255, 120, 0), brightness=255)
+    sent = next(data for _uuid, data, _ in reversed(fake.writes) if data[8:10] == b"\xe1\x03")
+    from custom_components.surplife_ble.core.protocol import iotbt_e1_segment_rgb
+
+    assert sent[8:] == iotbt_e1_segment_rgb(255, 120, 0, 100)
+    state = await coordinator._async_update_data()
+    assert state.rgb is not None
+
+
+# ---------------------------------------------------------------------------
+# Options flow
+# ---------------------------------------------------------------------------
+
+
+def option_flow(ha: SimpleNamespace, entry: FakeEntry) -> Any:
+    return ha.config_flow.SurplifeBleConfigFlow.async_get_options_flow(entry)
+
+
+def schema_fields(result: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {str(key.schema): key.default() for key in result["data_schema"].schema}
+
+
+@pytest.mark.asyncio
+async def test_options_flow_shows_the_identity_by_default(ha: SimpleNamespace) -> None:
+    entry = FakeEntry()
+    flow = option_flow(ha, entry)
+    assert isinstance(flow, ha.config_flow.SurplifeOptionsFlow)
+    result = await flow.async_step_init()
+    assert (result["type"], result["step_id"], result["errors"]) == ("form", "init", {})
+    assert schema_fields(result) == {
+        "red_gain": 1.0,
+        "green_gain": 1.0,
+        "blue_gain": 1.0,
+        "gamma": 1.0,
+    }
+    validators = {
+        str(key.schema): validator.config for key, validator in result["data_schema"].schema.items()
+    }
+    for name in ("red_gain", "green_gain", "blue_gain"):
+        assert (validators[name]["min"], validators[name]["max"], validators[name]["step"]) == (
+            0.0,
+            2.0,
+            0.05,
+        )
+    gamma = validators["gamma"]
+    assert (gamma["min"], gamma["max"], gamma["step"]) == (0.2, 4.0, 0.05)
+    # The selectors keep values in range.
+    with pytest.raises(vol.Invalid):
+        result["data_schema"]({"red_gain": 2.5})
+    assert result["data_schema"]({"gamma": 1.5})["gamma"] == 1.5
+
+
+@pytest.mark.asyncio
+async def test_options_flow_defaults_follow_the_stored_options(ha: SimpleNamespace) -> None:
+    entry = FakeEntry({"green_gain": 0.55, "gamma": 1.4, "ignored": 1})
+    result = await option_flow(ha, entry).async_step_init()
+    assert schema_fields(result) == {
+        "red_gain": 1.0,
+        "green_gain": 0.55,
+        "blue_gain": 1.0,
+        "gamma": 1.4,
+    }
+
+
+@pytest.mark.asyncio
+async def test_options_flow_saves_valid_values(ha: SimpleNamespace) -> None:
+    values = {"red_gain": 0.9, "green_gain": 0.6, "blue_gain": 1.1, "gamma": 1.3}
+    result = await option_flow(ha, FakeEntry()).async_step_init(values)
+    assert result == {"type": "create_entry", "data": values, "title": ""}
+    assert ColorCalibration.from_dict(result["data"]) == ColorCalibration(0.9, 0.6, 1.1, 1.3)
+
+
+@pytest.mark.asyncio
+async def test_options_flow_rejects_out_of_range_values(ha: SimpleNamespace) -> None:
+    values = {"red_gain": 2.5, "green_gain": 1.0, "blue_gain": 1.0, "gamma": 1.0}
+    result = await option_flow(ha, FakeEntry()).async_step_init(values)
+    assert result["type"] == "form"
+    assert result["errors"] == {"base": "invalid_calibration"}
+    assert schema_fields(result)["red_gain"] == 2.5  # the form keeps what was typed
+
+
+@pytest.mark.asyncio
+async def test_options_flow_is_only_for_curtains(ha: SimpleNamespace) -> None:
+    dx, _ = await make_dx23012(ha)
+    entry = dx.config_entry
+    entry.runtime_data = SimpleNamespace(coordinator=dx)
+    result = await option_flow(ha, entry).async_step_init()
+    assert result == {"type": "abort", "reason": "not_curtain"}
+    curtain, _ = await make_curtain(ha)
+    curtain.config_entry.runtime_data = SimpleNamespace(coordinator=curtain)
+    assert (await option_flow(ha, curtain.config_entry).async_step_init())["type"] == "form"
+    # Before the device is known (entry not loaded yet) the form is shown too.
+    assert (await option_flow(ha, FakeEntry()).async_step_init())["type"] == "form"
+
+
+def test_options_flow_texts_exist() -> None:
+    import json
+
+    root = Path(__file__).parents[1] / "custom_components" / "surplife_ble"
+    strings = json.loads((root / "strings.json").read_text(encoding="utf-8"))
+    init = strings["options"]["step"]["init"]
+    assert set(init["data"]) == {"red_gain", "green_gain", "blue_gain", "gamma"}
+    assert set(init["data_description"]) == set(init["data"])
+    assert "invalid_calibration" in strings["options"]["error"]
+    assert "not_curtain" in strings["options"]["abort"]
