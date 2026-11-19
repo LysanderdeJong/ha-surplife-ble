@@ -41,11 +41,15 @@ async def async_setup_entry(
 
 def curtain_device_info(coordinator: SurplifeCoordinator) -> DeviceInfo:
     """Device info shared by every curtain entity, so they sit under one device."""
+    resolution = coordinator.client.resolution if coordinator.client else None
+    packet = bytes.fromhex(resolution.source_packet_hex) if resolution else b""
+    # EA 81 bytes 3-4 are the big-endian product ID.
+    product = f"0x{packet[3] << 8 | packet[4]:02X}" if len(packet) > 4 else "unknown"
     return DeviceInfo(
         identifiers={(DOMAIN, coordinator.address)},
         connections={(dr.CONNECTION_BLUETOOTH, coordinator.address)},
         manufacturer="MIHEAL / Surplife",
-        model="Curtain lights (IOTBT, product 0xC2)",
+        model=f"Curtain lights (IOTBT, product {product})",
         name=coordinator.config_entry.title,
     )
 
