@@ -176,6 +176,7 @@ async def test_command_does_not_retry_programming_errors(
     calls = 0
 
     class FakeClient:
+        resolved = True
         resolution = SimpleNamespace(repeatable=True)
         state = LightState()
 
@@ -186,10 +187,281 @@ async def test_command_does_not_retry_programming_errors(
 
     client = FakeClient()
 
-    async def get_client() -> FakeClient:
+    async def get_client(**_kwargs: object) -> FakeClient:
         return client
 
     coordinator._async_get_client = get_client
     with pytest.raises(ValueError, match="invalid command"):
         await coordinator._async_command("set_rgb")
     assert calls == 1
+
+
+class PollingFakeClient:
+    """A resolved client whose state queries can be made to fail."""
+
+    is_curtain = False
+
+    def __init__(self) -> None:
+        self.resolved = True
+        self.resolution = SimpleNamespace(repeatable=True)
+        self.state = LightState(power=True, brightness=100)
+        self.error: Exception | None = None
+        self.queries = 0
+        self.disconnects = 0
+        self.cache_clears = 0
+
+    async def query_state(self, **_kwargs: object) -> LightState | None:
+        self.queries += 1
+        if self.error is not None:
+            raise self.error
+        return self.state
+
+    async def disconnect(self) -> None:
+        self.disconnects += 1
+
+    async def clear_cache(self) -> None:
+        self.cache_clears += 1
+
+
+def _polling_coordinator(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Any, PollingFakeClient]:
+    module = _load_coordinator(monkeypatch)
+    coordinator = module.SurplifeCoordinator(FakeHass(), FakeEntry())
+    client = PollingFakeClient()
+    coordinator.client = client
+    coordinator.data = None
+
+    async def get_client(**_kwargs: object) -> PollingFakeClient:
+        return client
+
+    coordinator._async_get_client = get_client
+    return module, coordinator, client
+
+
+@pytest.mark.asyncio
+async def test_silent_link_is_reconnected_and_last_state_is_kept(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, coordinator, client = _polling_coordinator(monkeypatch)
+    coordinator.data = await coordinator._async_update_data()
+
+    client.error = module.UpdateFailed("device did not return a supported state frame")
+    first = await coordinator._async_update_data()
+    assert first.assumed and first.power
+    assert client.disconnects == 0
+
+    second = await coordinator._async_update_data()
+    assert second.assumed
+    assert client.disconnects == 1
+
+    with pytest.raises(module.UpdateFailed):
+        await coordinator._async_update_data()
+
+    client.error = None
+    recovered = await coordinator._async_update_data()
+    assert not recovered.assumed
+    assert coordinator._consecutive_failures == 0
+
+
+@pytest.mark.asyncio
+async def test_bleak_error_clears_cache_and_reconnects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, coordinator, client = _polling_coordinator(monkeypatch)
+    client.error = module.BleakError("write failed")
+    with pytest.raises(module.UpdateFailed):
+        await coordinator._async_update_data()
+    assert client.cache_clears == 1
+    assert client.disconnects == 1
+
+
+@pytest.mark.asyncio
+async def test_unresolved_device_is_not_probed_on_every_poll(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, coordinator, client = _polling_coordinator(monkeypatch)
+    client.resolved = False
+    client.error = module.UpdateFailed("no supported state frame")
+    with pytest.raises(module.UpdateFailed):
+        await coordinator._async_update_data()
+    with pytest.raises(module.UpdateFailed, match="waiting"):
+        await coordinator._async_update_data()
+    assert client.queries == 1
+
+    coordinator._next_probe_at = asyncio.get_running_loop().time() - 1
+    with pytest.raises(module.UpdateFailed):
+        await coordinator._async_update_data()
+    assert client.queries == 2
+    # The wait doubles after each failed attempt.
+    assert coordinator._next_probe_at - asyncio.get_running_loop().time() > 20
+
+
+@pytest.mark.asyncio
+async def test_probe_gets_a_longer_budget_than_a_resolved_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, coordinator, client = _polling_coordinator(monkeypatch)
+    monkeypatch.setattr(module, "_OPERATION_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(module, "_PROBE_TIMEOUT_SECONDS", 1.0)
+
+    async def slow_query(**_kwargs: object) -> LightState:
+        await asyncio.sleep(0.05)
+        return client.state
+
+    client.query_state = slow_query
+    client.resolved = False
+    assert (await coordinator._async_update_data()).power
+
+    client.resolved = True
+    with pytest.raises(module.UpdateFailed):
+        await coordinator._async_update_data()
+
+
+class UnreachableFakeClient:
+    """A client whose connection attempt never completes, like a lamp out of range."""
+
+    is_curtain = False
+
+    def __init__(self) -> None:
+        self.connected = False
+        self.resolved = True
+        self.resolution = SimpleNamespace(repeatable=True)
+        self.state = LightState(power=True)
+        self.connects = 0
+        # Number of connection attempts that hang before one succeeds.
+        self.hang_attempts = 10**6
+
+    def set_ble_device(self, *_args: object) -> None:
+        return None
+
+    async def connect(self) -> None:
+        self.connects += 1
+        if self.connects <= self.hang_attempts:
+            await asyncio.sleep(3600)
+        self.connected = True
+
+    async def set_power(self, turn_on: bool) -> None:
+        self.state.power = turn_on
+
+    async def disconnect(self) -> None:
+        self.connected = False
+
+    async def clear_cache(self) -> None:
+        return None
+
+
+def _unreachable_coordinator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Any, Any, UnreachableFakeClient]:
+    module = _load_coordinator(monkeypatch)
+    monkeypatch.setattr(module, "_CONNECT_ATTEMPT_TIMEOUT_SECONDS", 0.01)
+    coordinator = module.SurplifeCoordinator(FakeHass(), FakeEntry())
+    coordinator._ble_device = object()
+    client = UnreachableFakeClient()
+    coordinator.client = client
+    return module, coordinator, client
+
+
+@pytest.mark.asyncio
+async def test_command_bounds_each_connection_attempt_and_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, coordinator, client = _unreachable_coordinator(monkeypatch)
+    with pytest.raises(module.ConnectionFailed, match="2 attempt.*timed out"):
+        await coordinator._async_command("set_power", True)
+    # Every attempt hung and was cut off; the command did not start a third.
+    assert client.connects == module._COMMAND_CONNECT_ATTEMPTS == 2
+
+
+@pytest.mark.asyncio
+async def test_command_succeeds_when_a_retried_connection_works(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _module, coordinator, client = _unreachable_coordinator(monkeypatch)
+    client.hang_attempts = 1
+    state = await coordinator._async_command("set_power", False)
+    assert state.power is False
+    assert client.connects == 2
+    assert coordinator._connect_failed_at is None
+
+
+@pytest.mark.asyncio
+async def test_queued_commands_fail_fast_after_a_failed_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, coordinator, client = _unreachable_coordinator(monkeypatch)
+    with pytest.raises(module.ConnectionFailed):
+        await coordinator._async_command("set_power", True)
+    with pytest.raises(module.ConnectionFailed, match="not reachable"):
+        await coordinator._async_command("set_power", False)
+    assert client.connects == 2
+
+    # Once the cooldown has passed, a command makes its own attempts again.
+    coordinator._connect_failed_at -= module._CONNECT_COOLDOWN_SECONDS
+    client.hang_attempts = 0
+    state = await coordinator._async_command("set_power", False)
+    assert state.power is False
+    assert client.connects == 3
+    assert coordinator._connect_failed_at is None
+
+
+@pytest.mark.asyncio
+async def test_unreachable_unresolved_device_retries_on_every_poll(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, coordinator, client = _unreachable_coordinator(monkeypatch)
+    client.resolved = False
+    coordinator.data = None
+    for _ in range(3):
+        with pytest.raises(module.ConnectionFailed):
+            await coordinator._async_update_data()
+    # Failed connections never sent probe frames, so they must not back off.
+    assert coordinator._next_probe_at is None
+    assert client.connects == 3
+
+
+@pytest.mark.asyncio
+async def test_poll_reconnects_during_command_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, coordinator, client = _unreachable_coordinator(monkeypatch)
+    with pytest.raises(module.ConnectionFailed):
+        await coordinator._async_command("set_power", True)
+
+    client.hang_attempts = 0
+
+    async def query_state(**_kwargs: object) -> LightState:
+        return client.state
+
+    client.query_state = query_state
+    coordinator.data = None
+    assert (await coordinator._async_update_data()).power
+    assert coordinator._connect_failed_at is None
+    await coordinator._async_command("set_power", False)
+    assert client.connects == 3
+
+
+@pytest.mark.asyncio
+async def test_curtain_upload_is_not_cut_off_by_command_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_coordinator(monkeypatch)
+    monkeypatch.setattr(module, "_OPERATION_TIMEOUT_SECONDS", 0.01)
+    coordinator = module.SurplifeCoordinator(FakeHass(), FakeEntry())
+
+    class FakeClient:
+        resolved = True
+        resolution = SimpleNamespace(repeatable=True)
+
+        async def upload_curtain_animation(self) -> None:
+            await asyncio.sleep(0.05)
+
+        async def set_power(self) -> None:
+            await asyncio.sleep(0.05)
+
+    async def get_client(**_kwargs: object) -> FakeClient:
+        return FakeClient()
+
+    coordinator._async_get_client = get_client
+    await coordinator._async_run_command("upload_curtain_animation")
+    with pytest.raises(TimeoutError):
+        await coordinator._async_run_command("set_power")
