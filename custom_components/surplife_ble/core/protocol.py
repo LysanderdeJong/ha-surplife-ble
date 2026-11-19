@@ -20,6 +20,8 @@ MODEL_FLOOR_LAMP_RGBCW = 0x0E
 KNOWN_EXTENDED_MODELS = {0x77, 0x82, 0xB6}
 # EA 81 bytes 3-4 (big-endian) are the device product ID, not a mesh address.
 IOTBT_PRODUCT_CURTAIN_C2 = 0x00C2
+# Same curtainLightE2 family in the vendor DB; 0xAC verified on a physical curtain.
+IOTBT_CURTAIN_PRODUCTS = {IOTBT_PRODUCT_CURTAIN_C2, 0x00AC, 0x00AD}
 CURTAIN_C2_CODEC = "iotbt-ea81-curtain-c2"
 
 # IOTBT DX23012 state field positions, confirmed by state-diff captures
@@ -112,14 +114,16 @@ def classify_packet(packet: bytes) -> tuple[ProtocolResolution, bytes, str] | No
                 codec = "extended-custom"
                 confidence = 0.95
                 capabilities.update({"rgb", "brightness", "candidate-white"})
-            elif (candidate[3] << 8 | candidate[4]) == IOTBT_PRODUCT_CURTAIN_C2:
+            elif (candidate[3] << 8 | candidate[4]) in IOTBT_CURTAIN_PRODUCTS:
                 # Bytes 3-4 are the big-endian product ID. See
                 # docs/IOTBT_CURTAIN_0xC2_FINDINGS.md.
                 model_num = None
                 firmware = None
                 codec = CURTAIN_C2_CODEC
                 confidence = 0.90
-                notes.append("IOTBT symphony curtain (product 0xC2).")
+                notes.append(
+                    f"IOTBT symphony curtain (product 0x{candidate[3] << 8 | candidate[4]:02X})."
+                )
             elif (
                 len(candidate) >= 27
                 and candidate[5] == 0x09

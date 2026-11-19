@@ -1,17 +1,17 @@
 {
   "domain": "surplife_ble",
   "name": "Surplife BLE",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "codeowners": [
-    "@NathanBland"
+    "@LysanderdeJong"
   ],
   "config_flow": true,
   "dependencies": [
     "bluetooth_adapters",
     "media_source"
   ],
-  "documentation": "https://github.com/NathanBland/ha-surplife-ble",
-  "issue_tracker": "https://github.com/NathanBland/ha-surplife-ble/issues",
+  "documentation": "https://github.com/LysanderdeJong/ha-surplife-ble",
+  "issue_tracker": "https://github.com/LysanderdeJong/ha-surplife-ble/issues",
   "integration_type": "device",
   "iot_class": "local_polling",
   "requirements": [

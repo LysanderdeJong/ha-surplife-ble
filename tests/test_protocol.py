@@ -449,3 +449,15 @@ def test_iotbt_e1_segment_rgb_clamps_brightness() -> None:
     assert cmd[10] == 100  # clamped to 100
     cmd_low = iotbt_e1_segment_rgb(255, 0, 0, -5)
     assert cmd_low[10] == 0  # clamped to 0
+
+
+def test_curtain_family_product_0xac_classifies_as_curtain() -> None:
+    # Real state from a 0xAC curtain (IOTBT, Surplife app).
+    packet = bytes.fromhex("ea810100ac0323666e32f000000000000101900000010cac02")
+    classified = classify_packet(packet)
+    assert classified is not None
+    assert classified[0].codec == "iotbt-ea81-curtain-c2"
+    assert any("product 0xAC" in note for note in classified[0].notes)
+    state = parse_state(packet)
+    assert state is not None
+    assert state.power is True
